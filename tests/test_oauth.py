@@ -1182,6 +1182,30 @@ class TestCredentialFingerprint:
         assert oauth.credential_fingerprint("") is None
 
 
+
+class TestSetupTokenDetection:
+    def test_inference_only_oauth_without_refresh_is_setup_token(self):
+        credentials = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-test",
+            "scopes": ["user:inference"],
+        }})
+        assert oauth.is_setup_token_credentials(credentials)
+
+    def test_refreshable_oauth_is_not_setup_token(self):
+        credentials = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-test",
+            "refreshToken": "refresh",
+            "scopes": ["user:inference"],
+        }})
+        assert not oauth.is_setup_token_credentials(credentials)
+
+    def test_wider_scope_oauth_is_not_setup_token(self):
+        credentials = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-test",
+            "scopes": ["user:inference", "user:profile"],
+        }})
+        assert not oauth.is_setup_token_credentials(credentials)
+
 class TestTokenAccountParsing:
     """The token endpoint's optional account identity must not be discarded."""
 

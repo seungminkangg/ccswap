@@ -5172,6 +5172,26 @@ class ClaudeAccountSwitcher:
         is the row's refused-credential stamp, if any."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
 
+        # Setup-tokens only carry user:inference, so the OAuth usage endpoint
+        # 403s them (and retrying burns its budget into 429). Read Claude
+        # Code's built-in /usage screen through an isolated session instead.
+        if oauth.is_setup_token_credentials(creds):
+            try:
+                from claude_swap.session import SessionManager
+                from claude_swap.setup_token_usage import fetch_setup_token_usage
+
+                session_dir, _, _ = SessionManager(self).setup_session(
+                    str(num), share=None
+                )
+                return FetchRecord(usage=fetch_setup_token_usage(session_dir))
+            except Exception:
+                self._logger.warning(
+                    "Setup-token usage probe failed for account %s; backing off.",
+                    num,
+                    exc_info=True,
+                )
+                return FetchRecord(error="setup-token-usage-unavailable")
+
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
         # Claude Code's own lock protocol, owner or not).

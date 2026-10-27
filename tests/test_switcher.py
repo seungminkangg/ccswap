@@ -752,6 +752,31 @@ class TestFetchAccountUsageSessionProfile:
     def _info(self, backup_creds: str) -> tuple:
         return (2, "test@example.com", "Org", "org-uuid", False, backup_creds, "")
 
+    def test_setup_token_uses_claude_usage_probe_not_oauth_endpoint(
+        self, temp_home: Path
+    ):
+        switcher = ClaudeAccountSwitcher()
+        setup_creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-setup",
+            "scopes": ["user:inference"],
+        }})
+        expected = {
+            "five_hour": {"pct": 4.0},
+            "seven_day": {"pct": 1.0},
+        }
+
+        with patch("claude_swap.session.SessionManager.setup_session",
+                   return_value=(Path("/profile"), "2", "test@example.com")) as setup_session, \
+             patch("claude_swap.setup_token_usage.fetch_setup_token_usage",
+                   return_value=expected) as probe, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as direct:
+            record = switcher._fetch_account_usage(self._info(setup_creds))
+
+        assert record.usage == expected
+        setup_session.assert_called_once_with("2", share=None)
+        probe.assert_called_once_with(Path("/profile"))
+        direct.assert_not_called()
+
     def test_fresh_session_credentials_fetch_read_only(self, temp_home: Path):
         """Profile creds are used with is_active=True (no refresh, no persist)."""
         switcher = ClaudeAccountSwitcher()

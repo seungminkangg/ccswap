@@ -10,6 +10,7 @@ import sys
 import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -389,6 +390,16 @@ class TestBootstrap:
         assert session_dir2 == session_dir
         assert len(refresh_rotates) == refresh_calls_after_bootstrap  # no new refresh
         assert (session_dir / ".credentials.json").read_text() == first_creds
+
+    def test_preserve_sharing_mode_never_syncs_profile_state(
+        self, manager, auth_status_tracks_seed, refresh_rotates
+    ):
+        with patch.object(manager, "_sync_sharing") as sync:
+            session_dir, _, _ = manager.setup_session("2", share=None)
+            manager.setup_session("2", share=None)
+
+        assert session_dir.is_dir()
+        sync.assert_not_called()
 
     def test_refresh_failure_uses_stored_creds(
         self, manager, auth_status_tracks_seed, monkeypatch, capsys

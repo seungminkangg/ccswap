@@ -41,6 +41,21 @@ def extract_oauth_data(credentials: str) -> dict | None:
     return oauth if isinstance(oauth, dict) else None
 
 
+def is_setup_token_credentials(credentials: str) -> bool:
+    """Whether credentials are an inference-only ``claude setup-token``."""
+    oauth = extract_oauth_data(credentials)
+    if not oauth:
+        return False
+    scopes = oauth.get("scopes")
+    return (
+        isinstance(oauth.get("accessToken"), str)
+        and oauth["accessToken"].startswith("sk-ant-oat")
+        and isinstance(scopes, list)
+        and set(scopes) == {"user:inference"}
+        and not oauth.get("refreshToken")
+    )
+
+
 def credential_fingerprint(credentials: str) -> str | None:
     """Stable identity fingerprint for a stored credential.
 
