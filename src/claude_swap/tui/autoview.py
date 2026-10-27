@@ -28,6 +28,8 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
     binding_pct,
+    live_elsewhere_message,
+    live_engine_running,
     pct_label,
 )
 from claude_swap.codex_autoswitch import CodexAutoSwitchEngine
@@ -145,6 +147,12 @@ class AutoScreen(Screen):
         self.watch(self.app, "theme", self._on_theme_change)
         self.watch(self.app, "mask_accounts", self._on_mask_change)
         self._start_engine(dry_run=True)
+        if self._live_elsewhere():
+            self._log_note(f"— {live_elsewhere_message(self.provider)}; watching only —")
+
+    def _live_elsewhere(self) -> bool:
+        return live_engine_running(self.app.switcher_for(self.provider).backup_dir,
+                                   self.provider)
 
     def on_unmount(self) -> None:
         if self._engine is not None:
@@ -406,6 +414,9 @@ class AutoScreen(Screen):
             return
         self._log_items.append(("event", event))
         self._write_log_item(("event", event))
+        if (event.kind == "error" and event.message == live_elsewhere_message(self.provider)
+                and self._engine is not None and not self._engine.dry_run):
+            self._restart_engine(dry_run=True)  # Lost the live lock race: watch only.
         if event.kind == "switch":
             self.app.request_refresh(self.provider)
 
@@ -445,6 +456,9 @@ class AutoScreen(Screen):
         if self._engine is None:
             return
         if self._engine.dry_run:
+            if self._live_elsewhere():
+                self._log_note(f"— {live_elsewhere_message(self.provider)} —")
+                return
             self.app.push_screen(
                 ConfirmModal(
                     "Go live? ccswap will switch your active account "

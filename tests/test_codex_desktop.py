@@ -699,3 +699,33 @@ def test_no_resume_without_a_confirmed_restart(accounts, mac, popen):
     result = switcher.switch_to("1", json_output=True)
 
     assert result["desktop"]["state"] == "relaunch-failed" and popen == []
+
+
+def test_only_one_live_codex_engine_runs(accounts, monkeypatch):
+    from claude_swap import autoswitch
+
+    switcher, _home = accounts
+    holder = autoswitch.live_engine_lock(switcher.backup_dir, "codex")
+    assert holder.acquire()  # A menu bar, TUI or `ccswap auto` already live.
+    try:
+        events = []
+        live = _engine(switcher, events)
+        monkeypatch.setattr(live, "tick", lambda: pytest.fail("must not tick"))
+        monkeypatch.setattr(autoswitch.time, "sleep", lambda _s: None)
+        real = autoswitch.acquire_live_lock
+        monkeypatch.setattr("claude_swap.codex_autoswitch.acquire_live_lock",
+                            lambda *a, **kw: real(*a, **{**kw, "wait": 0}))
+        assert live.run_loop() == 1
+        assert events[-1].kind == "error" and "already running" in events[-1].message
+        assert autoswitch.live_engine_running(switcher.backup_dir, "codex")
+
+        stopping = _engine(switcher, [])  # Stopped while waiting: a quiet exit.
+        stopping.stop()
+        assert stopping.run_loop() == 0
+
+        watcher = _engine(switcher, [], dry_run=True)  # Dry-run never needs the lock.
+        monkeypatch.setattr(watcher, "tick", lambda: watcher.stop())
+        assert watcher.run_loop() == 0
+    finally:
+        holder.release()
+    assert not autoswitch.live_engine_running(switcher.backup_dir, "codex")

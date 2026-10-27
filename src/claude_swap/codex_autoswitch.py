@@ -25,6 +25,8 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     binding_pct,
+    acquire_live_lock,
+    live_elsewhere_message,
 )
 from claude_swap.codex import CodexAccountSwitcher, _codex_restart_hint
 from claude_swap.locking import FileLock
@@ -346,8 +348,20 @@ class CodexAutoSwitchEngine:
         self._stop.set()
 
     def run_loop(self) -> int:
-        self._stop.clear()
-        while not self._stop.is_set():
-            self.tick()
-            self._stop.wait(self.settings.interval_seconds)
-        return 0
+        lock = None
+        if not self.dry_run:
+            lock = acquire_live_lock(self.switcher.backup_dir, "codex", self._stop)
+            if lock is None:
+                if self._stop.is_set():
+                    return 0
+                self._emit(ErrorEvent(message=live_elsewhere_message("codex"),
+                                      transient=False))
+                return 1
+        try:
+            while not self._stop.is_set():
+                self.tick()
+                self._stop.wait(self.settings.interval_seconds)
+            return 0
+        finally:
+            if lock is not None:
+                lock.release()

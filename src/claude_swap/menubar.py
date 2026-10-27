@@ -365,7 +365,7 @@ def format_title(
     if settings.title_pct in ("5h", "both"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            segments.append(f"5h {p:.0f}%")
     if settings.title_pct in ("7d", "both"):
         seven = None
         if isinstance(active_usage, dict):
@@ -373,7 +373,7 @@ def format_title(
         seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
         p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            segments.append(f"7d {p:.0f}%")
     if settings.title_scoped and isinstance(active_usage, dict):
         # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
         # dropdown rows; named so multiple scoped models stay distinguishable.
@@ -669,6 +669,7 @@ def run(switcher) -> int:
             self._codex_engine = None
             self._codex_engine_events: list = []
             self._codex_notices: list[tuple[str, str]] = []
+            self._live_conflicts: list[tuple[str, object]] = []
             self._codex_desktop_waiting = False
             self._codex_desktop_label: str | None = None
             # Claude Code integrations: live state read off the main thread
@@ -780,6 +781,7 @@ def run(switcher) -> int:
             self._detect_codex_active_change()
             self._drain_engine_events()
             self._drain_codex_engine_events()
+            self._drain_live_conflicts()
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto engine)
@@ -859,7 +861,9 @@ def run(switcher) -> int:
 
         def _run_engine(self, engine):
             try:
-                engine.run_loop()
+                if engine.run_loop() == 1:  # Another live Claude engine owns the lock.
+                    with self._event_lock:
+                        self._live_conflicts.append(("claude", engine))
             except Exception:
                 self.switcher._logger.debug("auto-switch engine crashed", exc_info=True)
 
@@ -918,7 +922,9 @@ def run(switcher) -> int:
 
         def _run_codex_engine(self, engine):
             try:
-                engine.run_loop()
+                if engine.run_loop() == 1:
+                    with self._event_lock:
+                        self._live_conflicts.append(("codex", engine))
             except Exception:
                 self.switcher._logger.debug("codex auto-switch engine crashed", exc_info=True)
 
@@ -936,6 +942,26 @@ def run(switcher) -> int:
         def _on_codex_engine_event(self, event):
             with self._event_lock:
                 self._codex_engine_events.append(event)
+
+        def _drain_live_conflicts(self):
+            """Turn off an auto toggle whose engine found another live one."""
+            from claude_swap.autoswitch import live_elsewhere_message
+
+            with self._event_lock:
+                conflicts, self._live_conflicts = self._live_conflicts, []
+            for provider, engine in conflicts:
+                if provider == "claude" and self._engine is engine:
+                    self._engine = None
+                    self.settings.auto_switch_enabled = False
+                elif provider == "codex" and self._codex_engine is engine:
+                    self._codex_engine = None
+                    self.settings.codex_auto_switch_enabled = False
+                else:
+                    continue  # Already stopped or replaced from the menu.
+                self.settings.save(settings_path)
+                rumps.notification("ccswap", "Auto-switch left off",
+                                   live_elsewhere_message(provider))
+                self.rebuild_menu()
 
         def _drain_codex_engine_events(self):
             with self._event_lock:

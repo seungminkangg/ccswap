@@ -319,7 +319,7 @@ def test_usage_log_key_ignores_clock_tracks_pct():
 
 def test_format_title_name_and_5h():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42%"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 5h 42%"
 
 
 def test_format_title_prefers_alias_over_local_part():
@@ -334,22 +334,22 @@ def test_format_title_name_only_when_pct_off():
 
 def test_format_title_5h_only():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="5h")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 42%"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 5h 42%"
 
 
 def test_format_title_7d_only():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="7d")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 18%"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 7d 18%"
 
 
 def test_format_title_both_windows():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 42% · 18%"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 5h 42% · 7d 18%"
 
 
 def test_format_title_both_windows_with_name():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42% · 18%"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 5h 42% · 7d 18%"
 
 
 def test_format_title_icon_only_when_off():
@@ -370,7 +370,7 @@ def test_format_title_scoped_after_windows_multiple_models():
         **_USAGE,
         "scoped": [{"name": "Fable", "pct": 55.0}, {"name": "Opus", "pct": 7.0}],
     }
-    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ 42% · 18% · Fable 55% · Opus 7%"
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ 5h 42% · 7d 18% · Fable 55% · Opus 7%"
 
 
 def test_format_title_scoped_off_by_default():
@@ -400,7 +400,7 @@ def test_format_title_both_drops_unavailable_windows():
 def test_format_title_both_keeps_available_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     # only 5h present -> 7d dropped, no trailing separator
-    assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 9%"
+    assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 5h 9%"
 
 
 # --- reset-time helpers --------------------------------------------------------
@@ -579,7 +579,7 @@ def test_usage_summary_scoped_reflects_passed_weekly_reset():
 def test_format_title_reflects_passed_weekly_reset():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="7d")
     usage = {"seven_day": {"pct": 95.0, "resets_at": _iso(-86400)}}
-    assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ 0%"
+    assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ 7d 0%"
 
 
 # --- run() app glue ------------------------------------------------------------

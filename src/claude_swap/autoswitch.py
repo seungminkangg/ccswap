@@ -475,6 +475,42 @@ class SleepEvent(AutoSwitchEvent):
         return f"sleeping {self.seconds / 60:.0f}m (until {self.until})"
 
 
+def live_engine_lock(backup_dir: Path, provider: str) -> FileLock:
+    """One live engine per provider across menu bar, TUI and ``ccswap auto``.
+
+    flock-based, so a crashed holder releases it. Two live engines for the
+    same accounts would switch over each other.
+    """
+    return FileLock(backup_dir / f".autoswitch-live-{provider}.lock", timeout=0)
+
+
+def acquire_live_lock(backup_dir: Path, provider: str, stopped: threading.Event,
+                      wait: float = 30.0) -> FileLock | None:
+    """Take the live lock, waiting out an engine of this process that is still
+    stopping (restart = stop + start). None when stopped or held elsewhere."""
+    lock = live_engine_lock(backup_dir, provider)
+    deadline = time.monotonic() + wait
+    while not lock.acquire():
+        if stopped.is_set() or time.monotonic() > deadline:
+            return None
+        time.sleep(0.2)
+    return lock
+
+
+def live_engine_running(backup_dir: Path, provider: str) -> bool:
+    lock = live_engine_lock(backup_dir, provider)
+    if not lock.acquire():
+        return True
+    lock.release()
+    return False
+
+
+def live_elsewhere_message(provider: str) -> str:
+    name = "Codex" if provider == "codex" else "Claude"
+    return (f"another live {name} auto-switch (menu bar, TUI or `ccswap auto`) is "
+            "already running; stop it there first")
+
+
 @dataclass(frozen=True)
 class ErrorEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "error"
@@ -2645,7 +2681,26 @@ class AutoSwitchEngine:
             return delay
 
     def run_loop(self) -> int:
-        """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        """Tick forever (until :meth:`stop`); a failing tick never kills it.
+
+        Returns 1 at once when another live Claude engine already runs.
+        """
+        lock = None
+        if not self.dry_run:
+            lock = acquire_live_lock(self.switcher.backup_dir, "claude", self._stop)
+            if lock is None:
+                if self._stop.is_set():
+                    return 0
+                self._emit(ErrorEvent(message=live_elsewhere_message("claude"),
+                                      transient=False))
+                return 1
+        try:
+            return self._loop()
+        finally:
+            if lock is not None:
+                lock.release()
+
+    def _loop(self) -> int:
         while True:
             # Clear at the top, not after the wait: a wake() racing a wait
             # timeout is then never lost — the tick right after this clear
