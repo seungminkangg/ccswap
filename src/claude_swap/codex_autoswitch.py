@@ -33,6 +33,8 @@ from claude_swap.settings import AutoSwitchSettings, atomic_write_json, gate_thr
 
 STATE_FILENAME = "codex_autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+# After a failed desktop handoff, wait this long before quitting Codex again.
+DESKTOP_BACKOFF_S = 600.0
 
 
 def _ref(number: str, email: str) -> dict:
@@ -301,7 +303,22 @@ class CodexAutoSwitchEngine:
             if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
-            result = self.switcher.switch_to(target, json_output=True)
+            failed_at = state.get("lastDesktopFailureAt")
+            if (self._restart_desktop and isinstance(failed_at, (int, float))
+                    and self.clock() - failed_at < DESKTOP_BACKOFF_S):
+                self._emit(NoSwitchEvent(
+                    reason="desktop-backoff",
+                    detail="the last Codex desktop handoff failed; retrying later",
+                ))
+                return TickOutcome.NO_ACTION
+            try:
+                result = self.switcher.switch_to(target, json_output=True)
+            except Exception:
+                if self._restart_desktop:
+                    state["schemaVersion"] = STATE_SCHEMA_VERSION
+                    state["lastDesktopFailureAt"] = self.clock()
+                    atomic_write_json(self.state_path, state)
+                raise
             if not result.get("switched"):
                 # desktop-busy waits without starting the cooldown.
                 self._emit(NoSwitchEvent(

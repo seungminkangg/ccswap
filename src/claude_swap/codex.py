@@ -149,7 +149,18 @@ class CodexAccountSwitcher:
         self.auth_file = self.codex_home / "auth.json"
         self.debug = debug
         self._usage_cache: dict[str, UsageEntry] = {}
-        self.restart_desktop = load_codex_settings(self.backup_dir).restart_desktop
+        self._restart_desktop: bool | None = None
+
+    @property
+    def restart_desktop(self) -> bool:
+        """``codex.restartDesktop``, re-read so long-running callers see changes."""
+        if self._restart_desktop is not None:
+            return self._restart_desktop
+        return load_codex_settings(self.backup_dir).restart_desktop
+
+    @restart_desktop.setter
+    def restart_desktop(self, value: bool) -> None:
+        self._restart_desktop = value
 
     def _setup_directories(self) -> None:
         for directory in (self.backup_dir, self.provider_dir, self.credentials_dir):
@@ -692,6 +703,42 @@ class CodexAccountSwitcher:
 
             return switch_with_desktop(self, identifier, json_output=json_output)
         return self._switch_auth(identifier, json_output=json_output, force=force)
+
+    def _switch_preflight(self, identifier: str) -> str:
+        """Read-only pass over the checks ``_switch_auth`` would fail on.
+
+        The desktop handoff runs this before quitting Codex so a refusal never
+        costs a restart. Conflict refusals say "session conflict" so rotation
+        moves on to its next candidate, as it does for ``_switch_auth``.
+        """
+        from claude_swap.codex_session import classify_session, slot_custody
+        from claude_swap.exceptions import SessionError
+
+        with FileLock(self.lock_file):
+            data = self._read_sequence()
+            number = self._resolve(identifier, data)
+            original_auth = self._read_switch_auth()
+            try:
+                outgoing = self._default_session_slots(original_auth, data) if original_auth else []
+            except (OSError, SessionError, ValueError, TypeError, KeyError):
+                raise SwitchError("Codex session conflict: cannot verify default aliases") from None
+            if (original_auth is not None and not outgoing
+                    and self._current_account_for_auth(original_auth, data) is None):
+                raise SwitchError(
+                    "The current Codex login is unmanaged. Run 'ccswap codex add' "
+                    "to preserve it before switching accounts."
+                )
+            for slot in dict.fromkeys([number, *outgoing]):
+                custody = slot_custody(self, slot)
+                if custody.state == "none":
+                    continue
+                if custody.state != "quiescent" or classify_session(self, slot).state == "conflict":
+                    raise SwitchError(
+                        f"Codex session conflict: Account {slot} session is {custody.state}")
+            auth = self._read_account_auth(number)
+            if auth is None or not self._identity_from_auth(auth)[0]:
+                raise SwitchError(f"Codex Account {number} has no usable stored auth.json backup")
+        return number
 
     def _switch_auth(self, identifier: str, json_output: bool = False, force: bool = False) -> dict[str, Any]:
         """Switch under R/.lock; Codex itself does not take this lock.

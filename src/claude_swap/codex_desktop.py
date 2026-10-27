@@ -68,8 +68,12 @@ class DesktopApp:
     pid: int
     started: float
     bundle: str
-    children: tuple[tuple[int, float], ...] = ()
-    server: int | None = None  # bundled ``codex app-server`` child
+    # Descendant ``codex`` processes (app-servers): the ones that write auth.json.
+    writers: tuple[tuple[int, float], ...] = ()
+
+    @property
+    def server(self) -> int | None:
+        return self.writers[0][0] if self.writers else None
 
 
 @dataclass
@@ -108,6 +112,8 @@ def _ps() -> list[Proc]:
         if len(parts) != 9:
             continue
         try:
+            # ponytail: local-time lstart is ambiguous in a DST fall-back hour; read
+            # p_starttime via sysctl if that ever matters.
             started = time.mktime(time.strptime(" ".join(parts[3:8]), "%a %b %d %H:%M:%S %Y"))
             rows.append(Proc(int(parts[0]), int(parts[1]), int(parts[2]), started, parts[8]))
         except ValueError:
@@ -194,10 +200,10 @@ def scan_desktop(home: Path) -> DesktopScan:
                 tree.append(child)
                 stack.append(child.pid)
         inside.update([proc.pid, *(c.pid for c in tree)])
-        server = next((c.pid for c in tree if _is_codex(c)), None)
-        scan.apps.append(DesktopApp(proc.pid, proc.started, bundle,
-                                    tuple((c.pid, c.started) for c in tree), server))
-        readable, value = _env_codex_home(server) if server else (True, None)
+        app = DesktopApp(proc.pid, proc.started, bundle,
+                         tuple((c.pid, c.started) for c in tree if _is_codex(c)))
+        scan.apps.append(app)
+        readable, value = _env_codex_home(app.server) if app.server else (True, None)
         if not readable or not _same_home(value, home):
             scan.issues.append(f"Codex desktop does not use CODEX_HOME {home}")
     for proc in mine:
@@ -244,8 +250,14 @@ def desktop_activity(home: Path, since: float, now: float | None = None) -> tupl
         return "unknown", f"Codex thread history unreadable ({exc.__class__.__name__})"
     if count:
         return "busy", f"{count} Codex turn(s) in progress"
-    written = max((p.stat().st_mtime for p in (db, db.with_name(db.name + "-wal")) if p.exists()),
-                  default=0.0)
+    written = 0.0
+    for path in (db, db.with_name(db.name + "-wal")):
+        try:
+            written = max(written, path.stat().st_mtime)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return "unknown", f"Codex thread history unreadable ({exc.__class__.__name__})"
     if now - written < QUIET_S:
         return "busy", f"Codex was active {max(0, int(now - written))}s ago"
     return "idle", ""
@@ -253,8 +265,16 @@ def desktop_activity(home: Path, since: float, now: float | None = None) -> tupl
 
 # ---- app control -------------------------------------------------------------
 
+def _gone(app: DesktopApp) -> bool:
+    return not _alive([(app.pid, app.started)])
+
+
 def quit_app(app: DesktopApp, timeout: float | None = None) -> str | None:
-    """Ask ``app`` to quit normally; return None once it and its children exited."""
+    """Ask ``app`` to quit normally; None once it and its app-servers exited.
+
+    Other descendants (MCP servers, background jobs) may outlive the app; they
+    cannot write ``auth.json``, so they are not waited for.
+    """
     timeout = QUIT_TIMEOUT_S if timeout is None else timeout
     try:
         done = subprocess.run(
@@ -269,7 +289,7 @@ def quit_app(app: DesktopApp, timeout: float | None = None) -> str | None:
             return ("macOS denied permission to control Codex; allow it under System "
                     "Settings > Privacy & Security > Automation")
         return f"quit request failed ({done.stderr.strip()[:120] or done.returncode})"
-    tracked = [(app.pid, app.started), *app.children]
+    tracked = [(app.pid, app.started), *app.writers]
     deadline = time.monotonic() + timeout
     while _alive(tracked):
         if time.monotonic() > deadline:
@@ -279,8 +299,13 @@ def quit_app(app: DesktopApp, timeout: float | None = None) -> str | None:
 
 
 def launch_app(bundle: str, home: Path, timeout: float | None = None) -> DesktopApp | None:
-    """Open ``bundle`` and wait for its main process and bundled app-server."""
+    """Open ``bundle``; return the instance it started once its app-server runs.
+
+    Only an instance absent before ``open`` counts, so an app someone reopened
+    on the old login is never mistaken for the relaunch.
+    """
     timeout = LAUNCH_TIMEOUT_S if timeout is None else timeout
+    before = {(a.pid, a.started) for a in scan_desktop(home).apps}
     try:
         subprocess.run(["open", bundle], capture_output=True, timeout=timeout, check=True)
     except (OSError, subprocess.SubprocessError):
@@ -288,7 +313,8 @@ def launch_app(bundle: str, home: Path, timeout: float | None = None) -> Desktop
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         scan = scan_desktop(home)
-        app = next((a for a in scan.apps if a.bundle == bundle), None)
+        app = next((a for a in scan.apps if a.bundle == bundle
+                    and (a.pid, a.started) not in before), None)
         if app is not None and app.server is not None and not scan.issues:
             return app
         time.sleep(_POLL_S)
@@ -297,13 +323,19 @@ def launch_app(bundle: str, home: Path, timeout: float | None = None) -> Desktop
 
 # ---- handoff marker ---------------------------------------------------------
 
+# Phases in which ccswap had confirmed the app closed; only these are recovered.
+_CLOSED_PHASES = ("closed", "switching", "launching")
+MARKER_MAX_AGE_S = 3600.0
+
+
 def _marker_path(switcher: CodexAccountSwitcher) -> Path:
     return switcher.provider_dir / MARKER_FILENAME
 
 
 def _write_marker(switcher: CodexAccountSwitcher, **fields: Any) -> None:
     switcher._setup_directories()
-    atomic_write_json(_marker_path(switcher), {"schemaVersion": 1, "pid": os.getpid(), **fields})
+    atomic_write_json(_marker_path(switcher), {
+        "schemaVersion": 1, "pid": os.getpid(), "startedAt": time.time(), **fields})
 
 
 def _clear_marker(switcher: CodexAccountSwitcher) -> None:
@@ -324,9 +356,13 @@ def recover(switcher: CodexAccountSwitcher) -> str | None:
     if marker is None:
         return None
     _clear_marker(switcher)  # One attempt only: never a restart loop.
-    bundle = marker.get("bundle")
-    # Holding the lock proves the marker's writer died mid-handoff.
-    if (not isinstance(bundle, str) or _bundle_info(bundle)[0] != BUNDLE_ID
+    bundle, started = marker.get("bundle"), marker.get("startedAt")
+    # Holding the lock proves the marker's writer died mid-handoff. A stale
+    # marker, or one from before the app was confirmed closed, reopens nothing.
+    if (marker.get("phase") not in _CLOSED_PHASES or not isinstance(bundle, str)
+            or not isinstance(started, (int, float))
+            or time.time() - started > MARKER_MAX_AGE_S
+            or _bundle_info(bundle)[0] != BUNDLE_ID
             or scan_desktop(switcher.codex_home).apps):
         return None
     launch_app(bundle, switcher.codex_home)
@@ -348,7 +384,10 @@ def recover_pending(switcher: CodexAccountSwitcher) -> str | None:
 
 # ---- orchestration -----------------------------------------------------------
 
-def _stay(switcher: CodexAccountSwitcher, reason: str, message: str) -> dict[str, Any]:
+def _stay(switcher: CodexAccountSwitcher, reason: str, message: str,
+          json_output: bool) -> dict[str, Any]:
+    if not json_output:
+        print(message)
     current = switcher.current_account_number()
     ref = {"number": int(current) if current else None, "email": ""}
     return {"switched": False, "from": ref, "to": dict(ref), "reason": reason,
@@ -367,7 +406,7 @@ def status(switcher: CodexAccountSwitcher) -> dict[str, Any]:
         "pid": app.pid if app else None,
         "activity": activity[0] or None,
         "detail": activity[1] or None,
-        "blocked": scan.problem(),
+        "blocked": scan.problem() if scan.apps or scan.issues else None,
         "otherCodexPids": scan.others,
         "pendingHandoff": pending_handoff(switcher),
     }
@@ -389,10 +428,12 @@ def switch_with_desktop(
     switcher: CodexAccountSwitcher, identifier: str, json_output: bool = False,
 ) -> dict[str, Any]:
     """Switch ``auth.json`` and restart a running, idle Codex desktop around it."""
+    from claude_swap.codex import _codex_restart_hint
+
     lock = FileLock(switcher.backup_dir / ".codex_desktop.lock", timeout=1.0)
     if not lock.acquire():
         return _stay(switcher, "desktop-switch-in-progress",
-                     "Another Codex desktop switch is in progress.")
+                     "Another Codex desktop switch is in progress.", json_output)
     try:
         recovered = recover(switcher)
         data = switcher._read_sequence()
@@ -400,53 +441,68 @@ def switch_with_desktop(
         if switcher.current_account_number() == number:
             return switcher._switch_auth(identifier, json_output=json_output)
         scan = scan_desktop(switcher.codex_home)
+        if scan.issues:
+            raise SwitchError(f"Codex desktop handoff refused: {scan.problem()}; account unchanged")
+        if not scan.apps:
+            result = switcher._switch_auth(identifier, json_output=json_output)
+            result["desktop"] = {"state": "not-running", "message": _codex_restart_hint()}
+            return result
         problem = scan.problem()
         if problem:
             raise SwitchError(f"Codex desktop handoff refused: {problem}; account unchanged")
         app = scan.app
-        if app is None:
-            result = switcher._switch_auth(identifier, json_output=json_output)
-            result["desktop"] = {"state": "not-running", "message": (
-                "Codex desktop is not running; the account applies when Codex starts.")}
-            return result
         state, detail = desktop_activity(switcher.codex_home, app.started)
         if state != "idle":
-            message = f"Waiting for Codex desktop to go idle ({detail}); account unchanged."
-            if not json_output:
-                print(message)
-            return _stay(switcher, "desktop-busy", message)
+            return _stay(switcher, "desktop-busy",
+                         f"Waiting for Codex desktop to go idle ({detail}); account unchanged.",
+                         json_output)
+        # Everything _switch_auth could refuse, checked before costing a restart.
+        switcher._switch_preflight(identifier)
 
-        current = switcher.current_account_number()
-        _write_marker(switcher, phase="quitting", bundle=app.bundle, to=int(number),
-                      **{"from": int(current) if current else None}, startedAt=time.time())
         failure = quit_app(app)
         if failure is None:
-            after = scan_desktop(switcher.codex_home)
+            try:
+                _write_marker(switcher, phase="closed", bundle=app.bundle, to=int(number))
+            except OSError as exc:
+                failure = f"could not record the handoff ({exc.__class__.__name__})"
+        if failure is None:
+            after = scan_desktop(switcher.codex_home)  # Immediately before the write.
             failure = ("Codex desktop reopened during the switch" if after.apps
                        else after.problem())
         if failure:
             _clear_marker(switcher)
+            if _gone(app) and not scan_desktop(switcher.codex_home).apps:
+                launch_app(app.bundle, switcher.codex_home)  # Unchanged login.
             raise SwitchError(f"Codex desktop handoff stopped: {failure}; account unchanged")
 
-        _write_marker(switcher, phase="switching", bundle=app.bundle, to=int(number),
-                      startedAt=time.time())
         try:
+            _write_marker(switcher, phase="switching", bundle=app.bundle, to=int(number))
             result = switcher._switch_auth(identifier, json_output=True)
         except Exception:
             launch_app(app.bundle, switcher.codex_home)  # Back on the unchanged login.
             _clear_marker(switcher)
             raise
-        _write_marker(switcher, phase="launching", bundle=app.bundle, to=int(number),
-                      startedAt=time.time())
+        try:
+            _write_marker(switcher, phase="launching", bundle=app.bundle, to=int(number))
+        except OSError:
+            pass  # The switch is done; a missing marker only skips crash recovery.
         relaunched = launch_app(app.bundle, switcher.codex_home)
         _clear_marker(switcher)
         active = switcher.current_account_number()
+        running = scan_desktop(switcher.codex_home).apps
         if active != number:
             message = (f"Codex login is Account {active}, not {number}, after the restart; "
                        "check 'ccswap codex status'")
             state = "verify-failed"
+        elif relaunched is not None and len(running) > 1:
+            message = ("A Codex desktop instance from before the switch is still running on "
+                       "the old login; quit Codex and open it again.")
+            state = "verify-failed"
         elif relaunched is None:
-            message = f"Switched, but Codex desktop did not reopen; open {app.bundle} manually."
+            message = (f"Switched, but Codex desktop did not reopen; open {app.bundle} manually."
+                       if not running else
+                       "Switched, but a Codex desktop instance opened before the switch "
+                       "finished may hold the old login; quit Codex and open it again.")
             state = "relaunch-failed"
         else:
             message = f"Codex desktop restarted on Account {number}."
@@ -456,8 +512,6 @@ def switch_with_desktop(
         if not json_output:
             print(f"Switched to Codex Account {number}: {result['to']['email']}")
             print(message)
-        if state == "verify-failed":
-            raise SwitchError(message)
         return result
     finally:
         lock.release()

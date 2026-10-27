@@ -39,6 +39,7 @@ class FakeMac:
         self.calls: list[list[str]] = []
         self.quit_mode = "ok"  # ok | refuse | denied | hang | reopen
         self.launch_ok = True
+        self.run_override = None
         self._next = 1000
 
     def start_app(self, bundle: str = BUNDLE, started: float = NOW - 3600) -> int:
@@ -59,6 +60,16 @@ class FakeMac:
         self.env[pid] = codex_home
         return pid
 
+    def quit_leaving(self, keep) -> None:
+        """Make the next quit exit everything except processes matching ``keep``."""
+        def run(argv, **kw):
+            if argv[0] != "osascript":
+                return FakeMac.run(self, argv, **kw)
+            self.calls.append(list(argv))
+            self.procs = [p for p in self.procs if keep(p)]
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        self.run_override = run
+
     def apps(self) -> list[int]:
         return [p.pid for p in self.procs if p.exe.endswith(".app/Contents/MacOS/ChatGPT")]
 
@@ -74,6 +85,8 @@ class FakeMac:
                 if self.quit_mode == "reopen":
                     self.start_app()
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[0] == "pgrep":  # _codex_restart_hint's liveness probe
+            return subprocess.CompletedProcess(argv, 1, b"", b"")
         if argv[0] == "open":
             if not self.launch_ok:
                 raise subprocess.CalledProcessError(1, argv)
@@ -92,7 +105,8 @@ def mac(monkeypatch):
     monkeypatch.setattr(codex_desktop, "_ps", lambda: list(fake.procs))
     monkeypatch.setattr(codex_desktop, "_env_codex_home",
                         lambda pid: (True, fake.env.get(pid)))
-    monkeypatch.setattr(codex_desktop.subprocess, "run", fake.run)
+    monkeypatch.setattr(codex_desktop.subprocess, "run",
+                        lambda argv, **kw: (fake.run_override or fake.run)(argv, **kw))
     monkeypatch.setattr(
         codex_desktop, "_bundle_info",
         lambda bundle: (codex_desktop.BUNDLE_ID, "ChatGPT") if bundle.endswith("ChatGPT.app")
@@ -160,7 +174,8 @@ def test_desktop_not_running_switches_without_launching(accounts, mac):
     result = switcher.switch_to("1", json_output=True)
 
     assert result["switched"] and result["desktop"]["state"] == "not-running"
-    assert mac.calls == [] and mac.apps() == []
+    assert "osascript" not in mac.commands() and "open" not in mac.commands()
+    assert mac.apps() == []
     assert _live(home) == _auth("one@example.com", "acct-1")
 
 
@@ -259,7 +274,7 @@ def test_failed_quit_keeps_the_login_and_clears_the_marker(accounts, mac, mode, 
     assert codex_desktop.pending_handoff(switcher) is None
 
 
-def test_switch_failure_after_quit_reopens_the_app_on_the_old_login(accounts, mac, monkeypatch):
+def test_late_switch_failure_reopens_the_app_on_the_old_login(accounts, mac, monkeypatch):
     switcher, home = accounts
     mac.start_app()
     before = _live(home)
@@ -333,7 +348,7 @@ def test_marker_holds_no_credentials(accounts, mac, monkeypatch):
     monkeypatch.setattr(codex_desktop, "_write_marker", spy)
     switcher.switch_to("1", json_output=True)
 
-    assert [json.loads(text)["phase"] for text in seen] == ["quitting", "switching", "launching"]
+    assert [json.loads(text)["phase"] for text in seen] == ["closed", "switching", "launching"]
     for text in seen:
         assert "token" not in text and "@" not in text
     if sys.platform != "win32":
@@ -420,3 +435,166 @@ def test_desktop_bundle_matches_only_the_main_binary(monkeypatch):
     assert codex_desktop._desktop_bundle(SERVER) is None
     assert codex_desktop._desktop_bundle(f"{BUNDLE}/Contents/MacOS/Other") is None
     assert codex_desktop._desktop_bundle("ChatGPT.app/Contents/MacOS/ChatGPT") is None
+
+
+def test_preflight_refusal_never_quits_the_app(accounts, mac, monkeypatch):
+    from claude_swap import codex_session
+
+    switcher, home = accounts
+    mac.start_app()
+    real = codex_session.slot_custody
+    monkeypatch.setattr(codex_session, "slot_custody", lambda sw, n, **kw: (
+        codex_session.Custody("live", "running") if n == "1" else real(sw, n, **kw)))
+
+    with pytest.raises(SwitchError, match="session conflict"):
+        switcher.switch_to("1", json_output=True)
+
+    assert mac.calls == [] and _live(home) == _auth("two@example.com", "acct-2")
+
+
+def test_lingering_helper_does_not_hold_up_the_handoff(accounts, mac):
+    switcher, home = accounts
+    mac.start_app()
+    mac.quit_leaving(lambda p: p.exe == "/bin/zsh")  # A background job outlives the app.
+
+    assert switcher.switch_to("1", json_output=True)["desktop"]["state"] == "restarted"
+    assert _live(home) == _auth("one@example.com", "acct-1")
+
+
+@pytest.mark.parametrize("keep, needle", [
+    (lambda p: p.exe == SERVER, "did not exit"),  # The app-server could still write.
+    (None, "shares this CODEX_HOME"),  # A new codex appeared after the quit.
+])
+def test_failure_after_the_quit_reopens_the_app(accounts, mac, keep, needle):
+    switcher, home = accounts
+    mac.start_app()
+    if keep is None:
+        mac.quit_leaving(lambda p: False)
+        original = mac.run_override
+
+        def run(argv, **kw):
+            result = original(argv, **kw)
+            if argv[0] == "osascript":
+                mac.spawn_cli(None)
+            return result
+        mac.run_override = run
+    else:
+        mac.quit_leaving(keep)
+
+    with pytest.raises(SwitchError, match=needle):
+        switcher.switch_to("1", json_output=True)
+
+    assert _live(home) == _auth("two@example.com", "acct-2")
+    assert "open" in mac.commands() and mac.apps()  # Not left closed.
+    assert codex_desktop.pending_handoff(switcher) is None
+
+
+def test_old_instance_reopened_mid_switch_is_not_reported_as_restarted(
+        accounts, mac, monkeypatch):
+    switcher, _home = accounts
+    mac.start_app()
+    real = switcher._switch_auth
+
+    def reopen_then_switch(*a, **kw):
+        mac.start_app(started=time.time() - 1)  # Loaded the old auth.json.
+        return real(*a, **kw)
+
+    monkeypatch.setattr(switcher, "_switch_auth", reopen_then_switch)
+    result = switcher.switch_to("1", json_output=True)
+
+    assert result["switched"] and result["desktop"]["state"] != "restarted"
+    assert "old login" in result["desktop"]["message"]
+
+
+def test_rotation_skips_conflicting_candidates_without_restarts(accounts, mac, monkeypatch):
+    from claude_swap import codex_session
+
+    switcher, home = accounts
+    (home / "auth.json").write_text(json.dumps(_auth("three@example.com", "acct-3")))
+    switcher.add_account(assume_yes=True)  # Active is now 3; rotation tries 1, then 2.
+    mac.start_app()
+    preflight = switcher._switch_preflight
+
+    def refuse_one(identifier):
+        if identifier == "1":
+            raise SwitchError("Codex session conflict: Account 1 session is live")
+        return preflight(identifier)
+
+    monkeypatch.setattr(switcher, "_switch_preflight", refuse_one)
+    monkeypatch.setattr(codex_session, "slot_custody",
+                        lambda *a, **kw: codex_session.Custody("none", "no_session_home"))
+
+    result = switcher.switch(strategy=None, json_output=True)
+
+    assert result["to"]["number"] == 2
+    assert mac.commands().count("osascript") == 1
+
+
+def test_auto_backs_off_after_a_failed_handoff(accounts, mac, monkeypatch):
+    switcher, home = accounts
+    mac.start_app()
+    _over_limit(monkeypatch, switcher)
+
+    def boom(*_a, **_kw):
+        raise SwitchError("Codex state changed during switch; retry")
+
+    monkeypatch.setattr(switcher, "_switch_auth", boom)
+    events = []
+    engine = _engine(switcher, events)
+    assert engine.tick() is TickOutcome.ERROR
+    stamp = time.time() - 3600
+    os.utime(home / "thread_history_1.sqlite", (stamp, stamp))
+    assert engine.tick() is TickOutcome.NO_ACTION
+
+    assert events[-1].reason == "desktop-backoff"
+    assert mac.commands().count("osascript") == 1
+
+
+def test_in_progress_refusal_is_printed(accounts, mac, capsys):
+    switcher, _home = accounts
+    mac.start_app()
+    holder = codex_desktop.FileLock(switcher.backup_dir / ".codex_desktop.lock")
+    assert holder.acquire()
+    try:
+        switcher.switch_to("1")
+    finally:
+        holder.release()
+    assert "in progress" in capsys.readouterr().out
+
+
+def test_cli_codex_without_a_desktop_does_not_block(accounts, mac):
+    switcher, home = accounts
+    mac.spawn_cli(None)
+
+    result = switcher.switch_to("1", json_output=True)
+
+    assert result["switched"] and result["desktop"]["state"] == "not-running"
+    assert mac.calls == [["pgrep", "-x", "codex"]]
+
+
+@pytest.mark.parametrize("fields", [
+    {"phase": "quitting"},  # The app was never confirmed closed.
+    {"phase": "closed", "startedAt": NOW - 2 * 3600},  # Stale.
+])
+def test_recovery_ignores_unconfirmed_or_stale_markers(accounts, mac, fields):
+    switcher, _home = accounts
+    codex_desktop._write_marker(switcher, bundle=BUNDLE, to=1, **fields)
+
+    assert codex_desktop.recover_pending(switcher) is None
+    assert mac.calls == [] and codex_desktop.pending_handoff(switcher) is None
+
+
+def test_same_home_defaults_to_dot_codex(tmp_path, monkeypatch):
+    monkeypatch.setattr(codex_desktop.Path, "home", lambda: tmp_path)
+    (tmp_path / ".codex").mkdir()
+    assert codex_desktop._same_home(None, tmp_path / ".codex")
+    assert codex_desktop._same_home(str(tmp_path / ".codex"), tmp_path / ".codex")
+    assert not codex_desktop._same_home(str(tmp_path / "other"), tmp_path / ".codex")
+
+
+def test_restart_setting_is_reread_by_long_lived_switchers(tmp_path, monkeypatch):
+    backup = tmp_path / "backup"
+    monkeypatch.setattr(codex, "get_backup_root", lambda: backup)
+    switcher = codex.CodexAccountSwitcher()
+    set_setting(backup, "codex.restartDesktop", "true")
+    assert switcher.restart_desktop is True

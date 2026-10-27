@@ -670,6 +670,7 @@ def run(switcher) -> int:
             self._codex_engine_events: list = []
             self._codex_notices: list[tuple[str, str]] = []
             self._codex_desktop_waiting = False
+            self._codex_desktop_label: str | None = None
             # Claude Code integrations: live state read off the main thread
             # (`claude plugin list` takes about a second); None until known.
             # A finished toggle leaves (ok, message) in _claude_note for the
@@ -732,6 +733,10 @@ def run(switcher) -> int:
                         codex_snap = _adapt_snapshot(craw)
                         self._log_usage(codex_snap, "codex")
                         self.codex_snapshot = codex_snap
+                        dirty = True
+                    label = self._read_codex_desktop_label()
+                    if label != self._codex_desktop_label:
+                        self._codex_desktop_label = label
                         dirty = True
                 if dirty:
                     self._dirty = True  # picked up by on_sync_tick on the main thread
@@ -951,6 +956,8 @@ def run(switcher) -> int:
                         rumps.notification("ccswap", "Codex switch waiting", ev.detail)
                 elif ev.kind == "no-switch" and ev.reason == "desktop-recovered":
                     rumps.notification("ccswap", "Codex desktop reopened", ev.detail)
+                elif ev.kind == "no-switch" and ev.reason != "desktop-backoff":
+                    self._codex_desktop_waiting = False  # The waiting stretch ended.
                 elif ev.kind == "all-exhausted":
                     rumps.notification("ccswap", "All Codex accounts exhausted", ev.human())
                 # No quarantine/config-warning arms: CodexAutoSwitchEngine emits
@@ -1095,16 +1102,17 @@ def run(switcher) -> int:
                 menu.add(item)
             return menu
 
-        def _codex_desktop_status_items(self, rumps):
-            if not self.codex_switcher.restart_desktop:
-                return []
+        def _read_codex_desktop_label(self):
+            """Desktop handoff status line; runs on the refresh worker thread."""
+            if self.codex_switcher is None or not self.codex_switcher.restart_desktop:
+                return None
             from claude_swap.codex_desktop import status
 
             try:
                 report = status(self.codex_switcher)
             except Exception:
                 self.switcher._logger.debug("codex desktop status failed", exc_info=True)
-                return [rumps.MenuItem("Desktop: status unavailable", callback=None)]
+                return "Desktop: status unavailable"
             if report["blocked"]:
                 label = f"Desktop: blocked ({report['blocked']})"
             elif not report["running"]:
@@ -1112,7 +1120,14 @@ def run(switcher) -> int:
             else:
                 label = f"Desktop: {report['activity']}" + (
                     f" ({report['detail']})" if report["detail"] else "")
-            return [rumps.MenuItem(label[:90], callback=None)]
+            return label[:90]
+
+        def _codex_desktop_status_items(self, rumps):
+            # Cached from the last refresh: never scan processes on the main thread.
+            label = self._codex_desktop_label
+            if not self.codex_switcher.restart_desktop or label is None:
+                return []
+            return [rumps.MenuItem(label, callback=None)]
 
         def on_toggle_codex_desktop(self, _sender):
             from claude_swap.settings import set_setting
@@ -1122,6 +1137,7 @@ def run(switcher) -> int:
                 self.codex_switcher.backup_dir, "codex.restartDesktop", str(enabled).lower()
             )):
                 self.codex_switcher.restart_desktop = enabled
+                self.refresh_async()
             self.rebuild_menu()
 
         def _run_codex_switch(self, fn):
