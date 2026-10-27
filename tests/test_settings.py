@@ -20,6 +20,7 @@ from claude_swap.settings import (
     atomic_write_json,
     AutoSwitchSettings,
     UiSettings,
+    CodexSettings,
     UpdateSettings,
     effective_settings,
     load_settings,
@@ -261,6 +262,7 @@ class TestSettingSpecs:
             "credentials": CredentialSettings(),
             "claude": ClaudeIntegrationSettings(),
             "updates": UpdateSettings(),
+            "codex": CodexSettings(),
         }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)

@@ -117,12 +117,22 @@ class UpdateSettings:
     check: bool = True
 
 
+@dataclass(frozen=True)
+class CodexSettings:
+    """Codex integration (``codex`` section). ``restart_desktop`` makes every
+    Codex switch (manual, rotation, auto, menu bar) quit the running Codex
+    desktop app while it is idle and reopen it on the selected login."""
+
+    restart_desktop: bool = False
+
+
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
     "credentials": CredentialSettings,
     "claude": ClaudeIntegrationSettings,
     "updates": UpdateSettings,
+    "codex": CodexSettings,
 }
 
 
@@ -244,6 +254,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "updates", "check", "check", "bool",
             help="Check PyPI once a day and print a hint when a newer release exists",
+        ),
+        SettingSpec(
+            "codex", "restartDesktop", "restart_desktop", "bool",
+            help="Quit the idle Codex desktop app on a Codex switch and reopen it",
         ),
     )
 }
@@ -605,6 +619,23 @@ def load_update_settings(backup_root: Path) -> UpdateSettings:
     return UpdateSettings(check=check)
 
 
+def load_codex_settings(backup_root: Path) -> CodexSettings:
+    """Load the codex section; missing/corrupt file or non-boolean → default."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("codex")
+    default = CodexSettings()
+    if not isinstance(section, dict):
+        return default
+    restart = section.get("restartDesktop", default.restart_desktop)
+    if not isinstance(restart, bool):
+        _logger.warning(
+            "settings.json: codex.restartDesktop %r is not true or false; using %r",
+            restart, default.restart_desktop,
+        )
+        return default
+    return CodexSettings(restart_desktop=restart)
+
+
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
     path = settings_path(backup_root)
@@ -785,6 +816,7 @@ def effective_settings(
         "ui": load_ui_settings(backup_root),
         "credentials": load_credential_settings(backup_root),
         "updates": load_update_settings(backup_root),
+        "codex": load_codex_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

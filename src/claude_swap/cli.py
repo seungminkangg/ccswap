@@ -617,6 +617,7 @@ def _codex_command(argv: list[str]) -> None:
         ("list", "List managed Codex accounts"),
         ("status", "Show active Codex account"),
         ("usage", "Fetch Codex subscription usage and diagnostic errors"),
+        ("desktop", "Show the Codex desktop app's handoff state (macOS)"),
     ):
         command = subcommands.add_parser(name, help=help_text)
         command.add_argument("--json", action="store_true")
@@ -639,6 +640,13 @@ def _codex_command(argv: list[str]) -> None:
     switch = subcommands.add_parser("switch", help="Switch to the next or named Codex account")
     switch.add_argument("account", nargs="?", metavar="NUM|EMAIL")
     switch.add_argument("--json", action="store_true")
+    switch.add_argument(
+        "--restart-desktop", action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "Quit an idle Codex desktop app and reopen it on the selected login "
+            "(default: codex.restartDesktop)"
+        ),
+    )
     switch.add_argument(
         "--strategy",
         choices=["best", "next-available", "consume-first"],
@@ -667,6 +675,13 @@ def _codex_command(argv: list[str]) -> None:
     auto.add_argument("--threshold", type=float, metavar="PCT")
     auto.add_argument("--cooldown", type=float, metavar="SECONDS")
     auto.add_argument("--dry-run", action="store_true", help="Report decisions without switching")
+    auto.add_argument(
+        "--restart-desktop", action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "Quit an idle Codex desktop app and reopen it on the selected login "
+            "(default: codex.restartDesktop)"
+        ),
+    )
     boundary = argv.index("--") if "--" in argv else len(argv)
     # Keep the child tail out of parsing and diagnostics.
     args = parser.parse_args(argv[:boundary] if is_run else argv)
@@ -689,12 +704,16 @@ def _codex_command(argv: list[str]) -> None:
                                  shared=args.shared, codex_args=codex_args,
                                  env=os.environ, cwd=Path.cwd()))
         switcher = CodexAccountSwitcher(debug=args.debug)
+        if getattr(args, "restart_desktop", None) is not None:
+            switcher.restart_desktop = args.restart_desktop
         if args.action == "list":
             switcher.list_accounts(json_output=args.json)
         elif args.action == "status":
             switcher.status(json_output=args.json)
         elif args.action == "usage":
             switcher.usage_status(json_output=args.json)
+        elif args.action == "desktop":
+            _codex_desktop_status(switcher, args.json)
         elif args.action == "redeem-reset":
             switcher.redeem_reset(args.account, assume_yes=args.yes, json_output=args.json)
         elif args.action == "add":
@@ -746,6 +765,8 @@ def _codex_command(argv: list[str]) -> None:
                 result = switcher.switch(strategy=args.strategy, json_output=args.json)
             if args.json:
                 print(json.dumps(result, indent=2))
+            if result.get("reason") in ("desktop-busy", "desktop-switch-in-progress"):
+                sys.exit(1)
     except ClaudeSwitchError as exc:
         error(f"Error: {exc}")
         sys.exit(1)
@@ -754,6 +775,26 @@ def _codex_command(argv: list[str]) -> None:
             raise
         error("Cannot initialize the Codex run; no new session writer started.")
         sys.exit(1)
+
+
+def _codex_desktop_status(switcher: CodexAccountSwitcher, as_json: bool) -> None:
+    from claude_swap.codex_desktop import status
+
+    report = status(switcher)
+    if as_json:
+        print(json.dumps(report, indent=2))
+        return
+    state = "on" if report["restartDesktop"] else "off (ccswap config set codex.restartDesktop true)"
+    print(f"Restart on switch: {state}")
+    if not report["running"]:
+        print("Codex desktop: not running")
+    elif report["bundle"]:
+        activity = report["activity"] + (f" ({report['detail']})" if report["detail"] else "")
+        print(f"Codex desktop: {report['bundle']} (PID {report['pid']}), {activity}")
+    if report["blocked"]:
+        warning(f"Handoff blocked: {report['blocked']}")
+    if report["pendingHandoff"]:
+        warning(f"Interrupted handoff pending: {report['pendingHandoff'].get('phase')}")
 
 
 def _list_dispatch(claude_switcher: "ClaudeAccountSwitcher", args) -> dict | None:

@@ -77,6 +77,10 @@ class CodexAutoSwitchEngine:
         self.clock = clock
         self._stop = threading.Event()
 
+    @property
+    def _restart_desktop(self) -> bool:
+        return getattr(self.switcher, "restart_desktop", False)
+
     def _state_lock(self) -> FileLock:
         return FileLock(self.state_path.parent / ".codex_autoswitch_state.lock")
 
@@ -105,6 +109,11 @@ class CodexAutoSwitchEngine:
             return TickOutcome.ERROR
 
     def _tick(self) -> TickOutcome:
+        if self._restart_desktop and not self.dry_run:
+            from claude_swap.codex_desktop import recover_pending
+
+            if recovered := recover_pending(self.switcher):
+                self._emit(NoSwitchEvent(reason="desktop-recovered", detail=recovered))
         snapshot = self.switcher.accounts_snapshot(fetch=None)
         accounts = {account.number: account for account in snapshot.accounts}
         current = snapshot.active_number
@@ -270,12 +279,18 @@ class CodexAutoSwitchEngine:
         trigger: str,
     ) -> TickOutcome:
         if self.dry_run:
+            if self._restart_desktop:
+                from claude_swap.codex_desktop import plan
+
+                warning = plan(self.switcher)
+            else:
+                warning = _codex_restart_hint()
             self._emit(
                 SwitchEvent(
                     trigger=trigger,
                     from_ref=_ref(current, current_email),
                     to_ref=_ref(target, target_email),
-                    warnings=[_codex_restart_hint()],
+                    warnings=[warning],
                     dry_run=True,
                 )
             )
@@ -288,19 +303,24 @@ class CodexAutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             result = self.switcher.switch_to(target, json_output=True)
             if not result.get("switched"):
-                self._emit(NoSwitchEvent(reason="already-active"))
+                # desktop-busy waits without starting the cooldown.
+                self._emit(NoSwitchEvent(
+                    reason=result.get("reason", "already-active"),
+                    detail=result.get("message", ""),
+                ))
                 return TickOutcome.NO_ACTION
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = target
             atomic_write_json(self.state_path, state)
 
+        desktop = result.get("desktop")
         self._emit(
             SwitchEvent(
                 trigger=trigger,
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
-                warnings=[_codex_restart_hint()],
+                warnings=[desktop["message"] if desktop else _codex_restart_hint()],
             )
         )
         return TickOutcome.SWITCHED

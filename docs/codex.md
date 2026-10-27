@@ -23,9 +23,36 @@ ccswap codex remove 2
 
 Usage-aware strategies consider switchable, enabled ChatGPT accounts only; API-key accounts have no subscription quota and are skipped.
 
-Codex switching preserves the rest of `CODEX_HOME` (configuration, skills, sessions, and history) and replaces only `auth.json`. Restart Codex after switching so its running process loads the selected login. For ChatGPT-backed file logins, the dashboard reads the same read-only Codex rate-limit endpoints used by Codex and shows the weekly window with a live reset countdown, the workspace/purchased credit balance, the per-user credit allowance when the service reports one, plus the number of banked resets and the earliest available reset's expiry. Credits, per-user allowances, and banked resets are shown separately because they are different resources. Window labels are derived from the duration reported by Codex, so older accounts that still return a 5-hour window remain correctly labelled. Each account is labelled by its ChatGPT plan (`Codex Team`, `Codex Pro`, `Codex Plus`, …) — read from the login token, the closest local equivalent to Claude Code's org name, since Codex stores no workspace name on disk. API-key accounts have no ChatGPT subscription quota, so they remain status-only. `ccswap codex auto` honors `autoswitch.strategy` (`best` or `consume-first`) and the per-window thresholds `autoswitch.threshold5h` and `autoswitch.threshold7d` (Codex Weekly), and uses the same threshold, cooldown, `--once`, `--dry-run`, and JSON event controls as Claude auto-switching; it prepares the account for the next Codex launch and reports when a restart is needed.
+Codex switching preserves the rest of `CODEX_HOME` (configuration, skills, sessions, and history) and replaces only `auth.json`. Restart Codex after switching so its running process loads the selected login, or let ccswap restart the desktop app ([Codex desktop restart](#codex-desktop-restart-macos-codexrestartdesktop)). For ChatGPT-backed file logins, the dashboard reads the same read-only Codex rate-limit endpoints used by Codex and shows the weekly window with a live reset countdown, the workspace/purchased credit balance, the per-user credit allowance when the service reports one, plus the number of banked resets and the earliest available reset's expiry. Credits, per-user allowances, and banked resets are shown separately because they are different resources. Window labels are derived from the duration reported by Codex, so older accounts that still return a 5-hour window remain correctly labelled. Each account is labelled by its ChatGPT plan (`Codex Team`, `Codex Pro`, `Codex Plus`, …) — read from the login token, the closest local equivalent to Claude Code's org name, since Codex stores no workspace name on disk. API-key accounts have no ChatGPT subscription quota, so they remain status-only. `ccswap codex auto` honors `autoswitch.strategy` (`best` or `consume-first`) and the per-window thresholds `autoswitch.threshold5h` and `autoswitch.threshold7d` (Codex Weekly), and uses the same threshold, cooldown, `--once`, `--dry-run`, and JSON event controls as Claude auto-switching; it prepares the account for the next Codex launch and reports when a restart is needed.
 
 Codex must use its documented file credential store. If your `~/.codex/config.toml` says `cli_auth_credentials_store = "keyring"`, change it to `"file"`, run `codex login`, then add the account. This deliberate restriction avoids writing a guessed OS-keyring entry.
+
+## Codex desktop restart (macOS, `codex.restartDesktop`)
+
+The Codex desktop app (bundle ID `com.openai.codex`, installed as `Codex.app` or `ChatGPT.app`) keeps the login in its bundled `codex app-server`, so a plain switch only takes effect after a restart. Turn on the desktop handoff to have ccswap do that restart for you:
+
+```bash
+ccswap config set codex.restartDesktop true   # every Codex switch path: manual, rotation, auto, menu bar
+ccswap codex switch 2 --restart-desktop       # one switch only (--no-restart-desktop skips it)
+ccswap codex desktop                          # current state: running bundle, idle/busy, blockers
+ccswap codex desktop --json
+```
+
+The menu bar's Codex submenu has the same **Restart Codex desktop on switch** toggle and shows the desktop state while it is on. The default is off, which keeps the switch-and-restart-yourself behaviour above.
+
+With the setting on, a switch:
+
+1. Finds exactly one desktop instance of your user. Two instances, a desktop that uses a different `CODEX_HOME`, or another `codex` process (CLI, IDE plugin) sharing the same `CODEX_HOME` refuse the switch with the account unchanged, because that process could write the old login back. A `codex` running in another `CODEX_HOME` (for example `ccswap codex run`) does not block.
+2. Waits while the desktop is working: any turn started since the app launched is still `inProgress` in Codex's thread history, or the history was written in the last 60 seconds. Missing or unreadable history also waits; ccswap never assumes idle. A waiting switch changes nothing, reports `desktop-busy` (exit code 1 for `codex switch`), and auto-switch retries on the next poll without starting its cooldown.
+3. Asks the app to quit normally (the same Apple Event as ⌘Q) and waits up to 30 seconds for the app and every process it had started to exit. A refused or slow quit (for example a confirmation dialog) stops the switch with the account unchanged. ccswap never sends signals or kills Codex.
+4. Switches `auth.json` through the regular locked, lineage-checked switch. If that fails, the app is reopened on the unchanged login.
+5. Reopens the same bundle that was running, waits for its app-server, and confirms the selected login is active. A desktop that was not running is not opened; selecting the already-active account does nothing.
+
+Conversations are not resumed or messaged. Only an idle app is restarted, so there is no interrupted turn to continue; reopen the chat you want in Codex. `--dry-run` auto-switching only describes what it would do to the desktop.
+
+ccswap records an in-flight handoff in `<backup root>/codex/desktop_handoff.json` (bundle path and slot numbers, no credentials, 0600). If ccswap is interrupted after closing the app, the next switch, auto-switch poll or menu-bar tick reopens the app once and clears the record; it never retries in a loop. Only one handoff runs at a time (`.codex_desktop.lock`).
+
+The handoff only coordinates with processes it can see. Another account switcher that rewrites `~/.codex/auth.json` on its own (for example Codex Switcher) must not run at the same time.
 
 ## Session mode (`codex run`)
 

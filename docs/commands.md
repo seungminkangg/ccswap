@@ -71,6 +71,7 @@ ccswap run 2                     # Run an account in this terminal only (session
 ccswap auto                      # Auto-switch when nearing rate limits (see [auto-switching.md](auto-switching.md))
 ccswap codex list                # List saved Codex CLI accounts
 ccswap codex switch 2            # Switch the file-backed Codex login
+ccswap codex desktop             # Codex desktop handoff state (macOS)
 ccswap config                    # Show or edit settings (see [configuration.md](configuration.md))
 ccswap list                      # Claude + Codex accounts with quota and reset times
 ccswap list --provider codex     # Restrict to one provider (claude|codex|all)

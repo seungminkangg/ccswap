@@ -7,6 +7,8 @@
 [![License](https://img.shields.io/pypi/l/ccswap.svg)](https://github.com/errhythm/ccswap/blob/main/LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/errhythm/ccswap?style=social)](https://github.com/errhythm/ccswap)
 
+> **Fork note.** This is a fork of [errhythm/ccswap](https://github.com/errhythm/ccswap) that adds a Codex desktop restart around Codex switches (`codex.restartDesktop`, macOS) and setup-token usage via Claude Code's `/usage`. Install it with `uv tool install --with rumps git+https://github.com/seungminkangg/ccswap@main`; `ccswap upgrade` then follows this fork.
+
 Multi-account and usage manager for Claude Code and OpenAI Codex. Save multiple logins, check their quota windows, switch manually or automatically before you hit a rate limit, and manage both providers from one dashboard.
 
 <img src="https://raw.githubusercontent.com/errhythm/ccswap/main/assets/tui-watch.png" width="760" alt="ccswap watch: live usage bars for every Claude Code and Codex account, with reset times and the active account marked">
@@ -50,6 +52,8 @@ You usually don't need to restart Claude Code after a switch. Codex always needs
 **Codex sessions.** `ccswap codex run 2` launches an account in a private home; the default login runs plain Codex. [Codex session mode](https://github.com/errhythm/ccswap/blob/main/docs/codex.md#session-mode-codex-run)
 
 **Codex.** `ccswap codex list`, `codex switch` and `codex auto` mirror the Claude commands. Codex must use its file credential store. [Codex accounts](https://github.com/errhythm/ccswap/blob/main/docs/codex.md)
+
+**Codex desktop.** `ccswap config set codex.restartDesktop true` makes every Codex switch quit the idle Codex desktop app and reopen it on the new login; a busy app is left alone until it goes idle. [Codex desktop restart](docs/codex.md#codex-desktop-restart-macos-codexrestartdesktop)
 
 **Dashboard and menu bar.** Run `ccswap` for the dashboard, or `ccswap watch` for the live monitor above. On macOS, `ccswap menubar --install-service` keeps a menu bar app running at login. [Dashboard and menu bar](https://github.com/errhythm/ccswap/blob/main/docs/dashboard.md)
 

@@ -668,6 +668,8 @@ def run(switcher) -> int:
                 self._codex_auth_mtime = 0.0
             self._codex_engine = None
             self._codex_engine_events: list = []
+            self._codex_notices: list[tuple[str, str]] = []
+            self._codex_desktop_waiting = False
             # Claude Code integrations: live state read off the main thread
             # (`claude plugin list` takes about a second); None until known.
             # A finished toggle leaves (ok, message) in _claude_note for the
@@ -933,10 +935,22 @@ def run(switcher) -> int:
         def _drain_codex_engine_events(self):
             with self._event_lock:
                 events, self._codex_engine_events = self._codex_engine_events, []
+                notices, self._codex_notices = self._codex_notices, []
+            for title, body in notices:
+                rumps.notification("ccswap", title, body)
+                self.refresh_async()
             for ev in events:
                 if ev.kind == "switch" and not getattr(ev, "dry_run", False):
+                    self._codex_desktop_waiting = False
                     rumps.notification("ccswap", "Codex auto-switched account", ev.human())
                     self.refresh_async()
+                elif ev.kind == "no-switch" and ev.reason == "desktop-busy":
+                    # Once per waiting stretch, not on every poll.
+                    if not self._codex_desktop_waiting:
+                        self._codex_desktop_waiting = True
+                        rumps.notification("ccswap", "Codex switch waiting", ev.detail)
+                elif ev.kind == "no-switch" and ev.reason == "desktop-recovered":
+                    rumps.notification("ccswap", "Codex desktop reopened", ev.detail)
                 elif ev.kind == "all-exhausted":
                     rumps.notification("ccswap", "All Codex accounts exhausted", ev.human())
                 # No quarantine/config-warning arms: CodexAutoSwitchEngine emits
@@ -1063,10 +1077,16 @@ def run(switcher) -> int:
             # Codex `switch()` discards its `strategy` argument (rotate-to-next
             # only), so unlike the Claude block above there's no "best" /
             # "next available" row to offer.
+            desktop_item = rumps.MenuItem(
+                "Restart Codex desktop on switch", callback=self.on_toggle_codex_desktop
+            )
+            desktop_item.state = 1 if self.codex_switcher.restart_desktop else 0
             for item in (
                 *account_items,
                 None,
                 rumps.MenuItem("Rotate to next", callback=self._codex_rotate()),
+                desktop_item,
+                *self._codex_desktop_status_items(rumps),
                 None,
                 self._codex_add_menu(rumps),
                 self._codex_disable_menu(rumps),
@@ -1074,6 +1094,63 @@ def run(switcher) -> int:
             ):
                 menu.add(item)
             return menu
+
+        def _codex_desktop_status_items(self, rumps):
+            if not self.codex_switcher.restart_desktop:
+                return []
+            from claude_swap.codex_desktop import status
+
+            try:
+                report = status(self.codex_switcher)
+            except Exception:
+                self.switcher._logger.debug("codex desktop status failed", exc_info=True)
+                return [rumps.MenuItem("Desktop: status unavailable", callback=None)]
+            if report["blocked"]:
+                label = f"Desktop: blocked ({report['blocked']})"
+            elif not report["running"]:
+                label = "Desktop: not running"
+            else:
+                label = f"Desktop: {report['activity']}" + (
+                    f" ({report['detail']})" if report["detail"] else "")
+            return [rumps.MenuItem(label[:90], callback=None)]
+
+        def on_toggle_codex_desktop(self, _sender):
+            from claude_swap.settings import set_setting
+
+            enabled = not self.codex_switcher.restart_desktop
+            if self._guard(lambda: set_setting(
+                self.codex_switcher.backup_dir, "codex.restartDesktop", str(enabled).lower()
+            )):
+                self.codex_switcher.restart_desktop = enabled
+            self.rebuild_menu()
+
+        def _run_codex_switch(self, fn):
+            """Switch Codex; a desktop handoff runs off the main thread."""
+            if not self.codex_switcher.restart_desktop:
+                if self._guard(fn):
+                    self._notify_codex_switched()
+                    self.refresh_async()
+                return
+
+            def work():
+                try:
+                    result = fn() or {}
+                    desktop = result.get("desktop") or {}
+                    if result.get("switched"):
+                        notice = ("Codex account switched",
+                                  desktop.get("message") or _codex_restart_hint())
+                    else:
+                        notice = ("Codex account not switched",
+                                  result.get("message") or result.get("reason", ""))
+                except ClaudeSwitchError as e:
+                    notice = ("Codex switch stopped", str(e))
+                except Exception as e:  # noqa: BLE001 - never kill the worker silently
+                    self.switcher._logger.warning("codex desktop switch failed", exc_info=True)
+                    notice = ("Codex switch failed", f"{type(e).__name__}: {e}")
+                with self._event_lock:
+                    self._codex_notices.append(notice)
+
+            threading.Thread(target=work, daemon=True).start()
 
         def _codex_add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
@@ -1232,16 +1309,12 @@ def run(switcher) -> int:
 
         def _make_codex_switch_to(self, num):
             def cb(_sender):
-                if self._guard(lambda: self.codex_switcher.switch_to(str(num))):
-                    self._notify_codex_switched()
-                    self.refresh_async()
+                self._run_codex_switch(lambda: self.codex_switcher.switch_to(str(num)))
             return cb
 
         def _codex_rotate(self):
             def cb(_sender):
-                if self._guard(lambda: self.codex_switcher.switch(strategy=None)):
-                    self._notify_codex_switched()
-                    self.refresh_async()
+                self._run_codex_switch(lambda: self.codex_switcher.switch(strategy=None))
             return cb
 
         def _make_remove(self, num):

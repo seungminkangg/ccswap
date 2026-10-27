@@ -48,6 +48,7 @@ from claude_swap.paths import get_backup_root
 from claude_swap.poll_policy import parse_reset_ts
 from claude_swap.printer import accent, dimmed, warning
 from claude_swap.process_detection import is_codex_running
+from claude_swap.settings import load_codex_settings
 from claude_swap.usage_store import SERVE_TTL_S, UsageEntry
 
 if TYPE_CHECKING:
@@ -148,6 +149,7 @@ class CodexAccountSwitcher:
         self.auth_file = self.codex_home / "auth.json"
         self.debug = debug
         self._usage_cache: dict[str, UsageEntry] = {}
+        self.restart_desktop = load_codex_settings(self.backup_dir).restart_desktop
 
     def _setup_directories(self) -> None:
         for directory in (self.backup_dir, self.provider_dir, self.credentials_dir):
@@ -682,6 +684,16 @@ class CodexAccountSwitcher:
         raise ConfigError("Current Codex auth.json is unreadable; refusing to overwrite it")
 
     def switch_to(self, identifier: str, json_output: bool = False, force: bool = False) -> dict[str, Any]:
+        """Switch the default login; every switch path (rotation, strategies,
+        auto, menu bar) lands here. With ``codex.restartDesktop`` a running,
+        idle Codex desktop is quit first and reopened on the selected login."""
+        if self.restart_desktop:
+            from claude_swap.codex_desktop import switch_with_desktop
+
+            return switch_with_desktop(self, identifier, json_output=json_output)
+        return self._switch_auth(identifier, json_output=json_output, force=force)
+
+    def _switch_auth(self, identifier: str, json_output: bool = False, force: bool = False) -> dict[str, Any]:
         """Switch under R/.lock; Codex itself does not take this lock.
 
         A residual race remains between the final D check and activation write.
