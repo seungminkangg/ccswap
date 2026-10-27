@@ -230,7 +230,6 @@ def test_unreadable_history_is_not_treated_as_idle(accounts, mac):
 @pytest.mark.parametrize("setup, needle", [
     (lambda mac: (mac.start_app(), mac.start_app("/Applications/Codex2/ChatGPT.app")),
      "2 Codex desktop instances"),
-    (lambda mac: (mac.start_app(), mac.spawn_cli(None)), "shares this CODEX_HOME"),
     (lambda mac: (mac.start_app(), mac.env.__setitem__(
         next(p.pid for p in mac.procs if p.exe == SERVER), "/elsewhere")),
      "does not use CODEX_HOME"),
@@ -243,6 +242,18 @@ def test_ambiguous_environments_are_refused(accounts, mac, setup, needle):
     with pytest.raises(SwitchError, match=needle):
         switcher.switch_to("1", json_output=True)
 
+    assert "osascript" not in mac.commands() and _live(home) == before
+
+
+def test_codex_cli_sharing_the_home_waits_instead_of_failing(accounts, mac):
+    switcher, home = accounts
+    mac.start_app()
+    mac.spawn_cli(None)
+    before = _live(home)
+
+    result = switcher.switch_to("1", json_output=True)
+
+    assert result["reason"] == "desktop-busy" and "shares this CODEX_HOME" in result["message"]
     assert "osascript" not in mac.commands() and _live(home) == before
 
 
@@ -598,3 +609,93 @@ def test_restart_setting_is_reread_by_long_lived_switchers(tmp_path, monkeypatch
     switcher = codex.CodexAccountSwitcher()
     set_setting(backup, "codex.restartDesktop", "true")
     assert switcher.restart_desktop is True
+
+
+LIMIT = json.dumps({"message": "You've hit your usage limit.",
+                    "codexErrorInfo": "usageLimitExceeded"})
+
+
+def _threads(home, *rows, written_ago: float = 3600) -> None:
+    """Newer thread history + state DBs: (thread, ordinal, status, error, done_ago, extra)."""
+    history = sqlite3.connect(home / "thread_history_2.sqlite")
+    history.execute("CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, rollout_ordinal"
+                    " INTEGER, status TEXT, error_json TEXT, started_at INTEGER,"
+                    " completed_at INTEGER)")
+    state = sqlite3.connect(home / "state_5.sqlite")
+    state.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER,"
+                  " thread_source TEXT, source TEXT, model TEXT, reasoning_effort TEXT)")
+    for thread, ordinal, status, error, done_ago, extra in rows:
+        done = int(time.time() - done_ago)
+        history.execute("INSERT INTO thread_turns VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (thread, f"{thread}-{ordinal}", ordinal, status, error, done - 5, done))
+        state.execute("INSERT OR IGNORE INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      (thread, str(home), extra.get("archived", 0), extra.get("thread_source"),
+                       extra.get("source", "vscode"), "gpt-test", "high"))
+    for con in (history, state):
+        con.commit()
+        con.close()
+    stamp = time.time() - written_ago
+    os.utime(home / "thread_history_2.sqlite", (stamp, stamp))
+
+
+@pytest.fixture
+def popen(monkeypatch):
+    calls = []
+    monkeypatch.setattr(codex_desktop, "_bundled_cli", lambda bundle: "/fake/codex")
+    monkeypatch.setattr(codex_desktop.subprocess, "Popen",
+                        lambda argv, **kw: calls.append((argv, kw)))
+    return calls
+
+
+def test_restart_resumes_limit_stopped_threads_once(accounts, mac, popen):
+    switcher, home = accounts
+    set_setting(switcher.backup_dir, "codex.resumeAfterRestart", "true")
+    _threads(home,
+             ("stopped", 0, "completed", None, 900, {}),
+             ("stopped", 1, "failed", LIMIT, 600, {}),
+             ("later-ok", 0, "failed", LIMIT, 600, {}),
+             ("later-ok", 1, "completed", None, 300, {}),  # Already continued by hand.
+             ("old", 0, "failed", LIMIT, 7 * 3600, {}),
+             ("other-error", 0, "failed", json.dumps({"codexErrorInfo": "other"}), 600, {}),
+             ("archived", 0, "failed", LIMIT, 600, {"archived": 1}),
+             ("created", 0, "failed", LIMIT, 600, {"thread_source": "agent_created_thread"}),
+             ("subagent", 0, "failed", LIMIT, 600,
+              {"source": '{"subagent":{"thread_spawn":{"depth":1}}}'}))
+    mac.start_app()
+
+    result = switcher.switch_to("1", json_output=True)
+
+    assert result["desktop"]["state"] == "restarted"
+    assert result["desktop"]["resumed"] == ["stopped"]
+    assert "Continuing 1 thread" in result["desktop"]["message"]
+    (argv, kw), = popen
+    assert argv == ["/fake/codex", "exec", "--skip-git-repo-check", "resume",
+                    "-m", "gpt-test", "-c", "model_reasoning_effort=high", "stopped", "continue"]
+    assert kw["cwd"] == str(home) and kw["env"]["CODEX_HOME"] == str(home)
+    assert kw["start_new_session"] and kw["stdout"] is subprocess.DEVNULL
+
+    switcher.switch_to("2", json_output=True)  # Same stopped turn: never sent twice.
+    assert len(popen) == 1
+
+
+def test_resume_is_off_by_default(accounts, mac, popen):
+    switcher, home = accounts
+    _threads(home, ("stopped", 0, "failed", LIMIT, 600, {}))
+    mac.start_app()
+
+    result = switcher.switch_to("1", json_output=True)
+
+    assert result["desktop"]["state"] == "restarted" and "resumed" not in result["desktop"]
+    assert popen == []
+
+
+def test_no_resume_without_a_confirmed_restart(accounts, mac, popen):
+    switcher, home = accounts
+    set_setting(switcher.backup_dir, "codex.resumeAfterRestart", "true")
+    _threads(home, ("stopped", 0, "failed", LIMIT, 600, {}))
+    mac.start_app()
+    mac.launch_ok = False
+
+    result = switcher.switch_to("1", json_output=True)
+
+    assert result["desktop"]["state"] == "relaunch-failed" and popen == []

@@ -121,9 +121,11 @@ class UpdateSettings:
 class CodexSettings:
     """Codex integration (``codex`` section). ``restart_desktop`` makes every
     Codex switch (manual, rotation, auto, menu bar) quit the running Codex
-    desktop app while it is idle and reopen it on the selected login."""
+    desktop app while it is idle and reopen it on the selected login.
+    ``resume_after_restart`` then continues threads the usage limit stopped."""
 
     restart_desktop: bool = False
+    resume_after_restart: bool = False
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -258,6 +260,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "codex", "restartDesktop", "restart_desktop", "bool",
             help="Quit the idle Codex desktop app on a Codex switch and reopen it",
+        ),
+        SettingSpec(
+            "codex", "resumeAfterRestart", "resume_after_restart", "bool",
+            help="After a desktop restart, continue threads the usage limit stopped",
         ),
     )
 }
@@ -626,14 +632,18 @@ def load_codex_settings(backup_root: Path) -> CodexSettings:
     default = CodexSettings()
     if not isinstance(section, dict):
         return default
-    restart = section.get("restartDesktop", default.restart_desktop)
-    if not isinstance(restart, bool):
-        _logger.warning(
-            "settings.json: codex.restartDesktop %r is not true or false; using %r",
-            restart, default.restart_desktop,
-        )
-        return default
-    return CodexSettings(restart_desktop=restart)
+    values = {}
+    for key, attr in (("restartDesktop", "restart_desktop"),
+                      ("resumeAfterRestart", "resume_after_restart")):
+        value = section.get(key, getattr(default, attr))
+        if not isinstance(value, bool):
+            _logger.warning(
+                "settings.json: codex.%s %r is not true or false; using %r",
+                key, value, getattr(default, attr),
+            )
+            value = getattr(default, attr)
+        values[attr] = value
+    return CodexSettings(**values)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:

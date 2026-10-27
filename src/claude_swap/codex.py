@@ -162,6 +162,11 @@ class CodexAccountSwitcher:
     def restart_desktop(self, value: bool) -> None:
         self._restart_desktop = value
 
+    @property
+    def resume_after_restart(self) -> bool:
+        """``codex.resumeAfterRestart``, re-read like :attr:`restart_desktop`."""
+        return load_codex_settings(self.backup_dir).resume_after_restart
+
     def _setup_directories(self) -> None:
         for directory in (self.backup_dir, self.provider_dir, self.credentials_dir):
             directory.mkdir(parents=True, exist_ok=True)

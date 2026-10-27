@@ -42,13 +42,23 @@ The menu bar's Codex submenu has the same **Restart Codex desktop on switch** to
 
 With the setting on, a switch:
 
-1. Finds exactly one desktop instance of your user. Two instances, a desktop that uses a different `CODEX_HOME`, or another `codex` process (CLI, IDE plugin) sharing the same `CODEX_HOME` refuse the switch with the account unchanged, because that process could write the old login back. A `codex` running in another `CODEX_HOME` (for example `ccswap codex run`) does not block.
+1. Finds exactly one desktop instance of your user. Two instances or a desktop that uses a different `CODEX_HOME` refuse the switch with the account unchanged. Another `codex` process (CLI, IDE plugin) sharing the same `CODEX_HOME` could write the old login back, so the switch waits for it to exit (`desktop-busy`, as in step 2). A `codex` running in another `CODEX_HOME` (for example `ccswap codex run`) does not block.
 2. Waits while the desktop is working: any turn started since the app launched is still `inProgress` in Codex's thread history, or the history was written in the last 60 seconds. Missing or unreadable history also waits; ccswap never assumes idle. A waiting switch changes nothing, reports `desktop-busy` (exit code 1 for `codex switch`), and auto-switch retries on the next poll without starting its cooldown.
-3. Asks the app to quit normally (the same Apple Event as ⌘Q) and waits up to 30 seconds for the app and every process it had started to exit. A refused or slow quit (for example a confirmation dialog) stops the switch with the account unchanged. ccswap never sends signals or kills Codex.
+3. Asks the app to quit normally (the same Apple Event as ⌘Q) and waits up to 30 seconds for the app and its `codex` app-servers to exit (other helpers may outlive it; they cannot write `auth.json`). A refused or slow quit (for example a confirmation dialog) stops the switch with the account unchanged. ccswap never sends signals or kills Codex.
 4. Switches `auth.json` through the regular locked, lineage-checked switch. If that fails, the app is reopened on the unchanged login.
 5. Reopens the same bundle that was running, waits for its app-server, and confirms the selected login is active. A desktop that was not running is not opened; selecting the already-active account does nothing.
 
-Conversations are not resumed or messaged. Only an idle app is restarted, so there is no interrupted turn to continue; reopen the chat you want in Codex. `--dry-run` auto-switching only describes what it would do to the desktop.
+Only an idle app is restarted, so no running turn is cut off. `--dry-run` auto-switching only describes what it would do to the desktop.
+
+### Continuing threads the usage limit stopped (`codex.resumeAfterRestart`)
+
+A thread whose turn failed with Codex's usage-limit error stays stopped after a switch; by default you reopen it and type `continue` yourself. To have ccswap do that once per stopped turn:
+
+```bash
+ccswap config set codex.resumeAfterRestart true   # needs codex.restartDesktop
+```
+
+The menu bar has the same **Continue limit-stopped threads after restart** toggle. After a confirmed restart onto the new login, ccswap picks threads whose latest turn failed with `usageLimitExceeded` in the last 6 hours (at most 5; archived and subagent threads are skipped) and runs `codex exec resume <thread> continue` for each in the thread's working directory, with the desktop's bundled CLI and your `config.toml` settings (sandbox, approvals, model). The desktop's own app-server accepts no outside clients, so the continuation runs in that background process and is written to the same thread; open the thread in the desktop to follow it, and let it finish before typing in that thread. Each stopped turn is recorded in `<backup root>/codex/resumed_turns.json` before it is sent, so it is never continued twice, even if ccswap crashes. The switch result and menu-bar notice say how many threads were continued. While a continuation runs, the next desktop switch waits for it.
 
 ccswap records an in-flight handoff in `<backup root>/codex/desktop_handoff.json` (bundle path and slot numbers, no credentials, 0600). If ccswap is interrupted after closing the app, the next switch, auto-switch poll or menu-bar tick reopens the app once and clears the record; it never retries in a loop. Only one handoff runs at a time (`.codex_desktop.lock`).
 

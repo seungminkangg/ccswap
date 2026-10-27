@@ -7,7 +7,7 @@ holds the login in memory and writes refreshed tokens back to
 does nothing until a restart, and a stale writer could even put the old login
 back. The handoff here is:
 
-1. find exactly one running desktop instance of this user and refuse when
+1. find exactly one running desktop instance of this user, and wait while
    another Codex process outside it shares the same ``CODEX_HOME``;
 2. wait while any turn started in this app lifetime is still ``inProgress`` in
    Codex's thread history (or the history was written moments ago, or cannot
@@ -18,8 +18,11 @@ back. The handoff here is:
    :meth:`CodexAccountSwitcher._switch_auth`;
 5. reopen exactly the bundle that was running and confirm the selected login.
 
-Conversations are not resumed or messaged: because only an idle app is
-restarted, there is no interrupted turn to continue. A small marker file
+Only an idle app is restarted, so no running turn is cut off. Threads whose
+last turn the usage limit had already stopped are continued afterwards only with
+``codex.resumeAfterRestart``: each such turn gets one ``continue`` through the
+bundled ``codex exec resume`` (the desktop's own app-server takes no outside
+clients), recorded first so it is never sent twice. A small marker file
 records an in-flight handoff (bundle path and slot numbers only, no secrets) so
 an interrupted ccswap reopens the app once instead of leaving it closed.
 """
@@ -27,8 +30,10 @@ an interrupted ccswap reopens the app once instead of leaving it closed.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import plistlib
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -44,6 +49,8 @@ from claude_swap.settings import atomic_write_json
 if TYPE_CHECKING:
     from claude_swap.codex import CodexAccountSwitcher
 
+_logger = logging.getLogger("claude-swap")
+
 BUNDLE_ID = "com.openai.codex"
 MARKER_FILENAME = "desktop_handoff.json"
 QUIT_TIMEOUT_S = 30.0
@@ -52,6 +59,11 @@ LAUNCH_TIMEOUT_S = 30.0
 # inProgress row (covers a projection that has not caught up yet).
 QUIET_S = 60.0
 _POLL_S = 0.5
+RESUME_PROMPT = "continue"
+RESUME_WINDOW_S = 6 * 3600.0  # Older limit stops are left to the user.
+RESUME_MAX = 5  # Threads per restart; each one spends the new account's quota.
+RESUME_LEDGER = "resumed_turns.json"
+_LEDGER_KEEP_S = 7 * 86400.0
 
 
 @dataclass(frozen=True)
@@ -225,18 +237,22 @@ def _alive(pairs: list[tuple[int, float]]) -> list[int]:
 
 # ---- activity --------------------------------------------------------------
 
-def desktop_activity(home: Path, since: float, now: float | None = None) -> tuple[str, str]:
-    """Return ("idle"|"busy"|"unknown", detail) for turns since app start."""
-    now = time.time() if now is None else now
-
+def _latest_db(home: Path, stem: str) -> Path | None:
+    """Newest ``<stem>_<N>.sqlite`` in ``home`` (Codex bumps N on migrations)."""
     def version(path: Path) -> int:
         suffix = path.stem.rpartition("_")[2]
         return int(suffix) if suffix.isdecimal() else -1
 
-    dbs = sorted(home.glob("thread_history_*.sqlite"), key=version)
-    if not dbs:
+    dbs = sorted(home.glob(f"{stem}_*.sqlite"), key=version)
+    return dbs[-1] if dbs else None
+
+
+def desktop_activity(home: Path, since: float, now: float | None = None) -> tuple[str, str]:
+    """Return ("idle"|"busy"|"unknown", detail) for turns since app start."""
+    now = time.time() if now is None else now
+    db = _latest_db(home, "thread_history")
+    if db is None:
         return "unknown", "Codex thread history not found"
-    db = dbs[-1]
     try:
         con = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2)
         try:
@@ -319,6 +335,87 @@ def launch_app(bundle: str, home: Path, timeout: float | None = None) -> Desktop
             return app
         time.sleep(_POLL_S)
     return None
+
+
+# ---- resume ------------------------------------------------------------------
+
+def _query(db: Path, sql: str, args: tuple) -> list[tuple]:
+    con = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2)
+    try:
+        return con.execute(sql, args).fetchall()
+    finally:
+        con.close()
+
+
+def stopped_threads(home: Path, now: float | None = None) -> list[tuple[str, str, str, list[str]]]:
+    """(thread, turn, cwd, model args) whose latest turn hit the usage limit recently.
+
+    Archived and subagent threads are left alone; a subagent is continued by
+    its parent. The thread's own model and effort are kept, not config.toml's.
+    """
+    now = time.time() if now is None else now
+    history, state = _latest_db(home, "thread_history"), _latest_db(home, "state")
+    if history is None or state is None:
+        return []
+    turns = _query(history, """
+        SELECT t.thread_id, t.turn_id FROM thread_turns t
+        WHERE t.status = 'failed'
+          AND json_extract(t.error_json, '$.codexErrorInfo') = 'usageLimitExceeded'
+          AND t.completed_at >= ?
+          AND t.rollout_ordinal = (SELECT MAX(rollout_ordinal) FROM thread_turns
+                                   WHERE thread_id = t.thread_id)
+        ORDER BY t.completed_at DESC""", (int(now - RESUME_WINDOW_S),))
+    found = []
+    for thread, turn in turns:
+        row = _query(state, """
+            SELECT cwd, model, reasoning_effort FROM threads
+            WHERE id = ? AND archived = 0 AND source NOT LIKE '%"subagent"%'
+              AND COALESCE(thread_source, '') != 'agent_created_thread'""", (thread,))
+        if row:
+            cwd, model, effort = row[0]
+            args = [*(["-m", model] if model else []),
+                    *(["-c", f"model_reasoning_effort={effort}"] if effort else [])]
+            found.append((thread, turn, cwd, args))
+    return found
+
+
+def _bundled_cli(bundle: str) -> str | None:
+    """The desktop's own CLI (same version as the app-server), else PATH codex."""
+    cli = Path(bundle) / "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+    return str(cli) if cli.is_file() else shutil.which("codex")
+
+
+def resume_stopped(switcher: CodexAccountSwitcher, bundle: str) -> list[str]:
+    """Send one ``continue`` to each limit-stopped thread; return thread ids."""
+    ledger_path = switcher.provider_dir / RESUME_LEDGER
+    try:
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        ledger = {}
+    now = time.time()
+    ledger = {turn: at for turn, at in (ledger.items() if isinstance(ledger, dict) else ())
+              if isinstance(at, (int, float)) and now - at < _LEDGER_KEEP_S}
+    todo = [t for t in stopped_threads(switcher.codex_home, now) if t[1] not in ledger]
+    cli = _bundled_cli(bundle)
+    if not todo or cli is None:
+        return []
+    started = []
+    for thread, turn, cwd, model_args in todo[:RESUME_MAX]:
+        ledger[turn] = now
+        atomic_write_json(ledger_path, ledger)  # Recorded before sending: at most once.
+        try:
+            subprocess.Popen(
+                [cli, "exec", "--skip-git-repo-check", "resume", *model_args,
+                 thread, RESUME_PROMPT],
+                cwd=cwd if os.path.isdir(cwd) else str(Path.home()),
+                env={**os.environ, "CODEX_HOME": str(switcher.codex_home)},
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+        except OSError:
+            continue
+        started.append(thread)
+    return started
 
 
 # ---- handoff marker ---------------------------------------------------------
@@ -447,6 +544,10 @@ def switch_with_desktop(
             result = switcher._switch_auth(identifier, json_output=json_output)
             result["desktop"] = {"state": "not-running", "message": _codex_restart_hint()}
             return result
+        if len(scan.apps) == 1 and scan.others:
+            # A CLI run (or a thread we resumed) is transient: wait, not an error.
+            return _stay(switcher, "desktop-busy",
+                         f"Waiting for {scan.problem()}; account unchanged.", json_output)
         problem = scan.problem()
         if problem:
             raise SwitchError(f"Codex desktop handoff refused: {problem}; account unchanged")
@@ -507,8 +608,18 @@ def switch_with_desktop(
         else:
             message = f"Codex desktop restarted on Account {number}."
             state = "restarted"
+        resumed: list[str] = []
+        if state == "restarted" and switcher.resume_after_restart:
+            try:
+                resumed = resume_stopped(switcher, app.bundle)
+            except (OSError, sqlite3.Error):
+                _logger.warning("resuming stopped Codex threads failed", exc_info=True)
+            if resumed:
+                message += (f" Continuing {len(resumed)} thread(s) the usage limit stopped; "
+                            "let them finish before typing in them.")
         result["desktop"] = {"state": state, "message": message, "bundle": app.bundle,
-                             **({"recovered": recovered} if recovered else {})}
+                             **({"recovered": recovered} if recovered else {}),
+                             **({"resumed": resumed} if resumed else {})}
         if not json_output:
             print(f"Switched to Codex Account {number}: {result['to']['email']}")
             print(message)

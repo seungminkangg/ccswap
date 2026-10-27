@@ -1088,11 +1088,18 @@ def run(switcher) -> int:
                 "Restart Codex desktop on switch", callback=self.on_toggle_codex_desktop
             )
             desktop_item.state = 1 if self.codex_switcher.restart_desktop else 0
+            resume_item = rumps.MenuItem(
+                "Continue limit-stopped threads after restart",
+                callback=self.on_toggle_codex_resume if self.codex_switcher.restart_desktop
+                else None,
+            )
+            resume_item.state = 1 if self.codex_switcher.resume_after_restart else 0
             for item in (
                 *account_items,
                 None,
                 rumps.MenuItem("Rotate to next", callback=self._codex_rotate()),
                 desktop_item,
+                resume_item,
                 *self._codex_desktop_status_items(rumps),
                 None,
                 self._codex_add_menu(rumps),
@@ -1138,6 +1145,15 @@ def run(switcher) -> int:
             )):
                 self.codex_switcher.restart_desktop = enabled
                 self.refresh_async()
+            self.rebuild_menu()
+
+        def on_toggle_codex_resume(self, _sender):
+            from claude_swap.settings import set_setting
+
+            enabled = not self.codex_switcher.resume_after_restart
+            self._guard(lambda: set_setting(
+                self.codex_switcher.backup_dir, "codex.resumeAfterRestart", str(enabled).lower()
+            ))
             self.rebuild_menu()
 
         def _run_codex_switch(self, fn):

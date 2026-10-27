@@ -7,7 +7,7 @@
 [![License](https://img.shields.io/pypi/l/ccswap.svg)](https://github.com/errhythm/ccswap/blob/main/LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/errhythm/ccswap?style=social)](https://github.com/errhythm/ccswap)
 
-> **Fork note.** This is a fork of [errhythm/ccswap](https://github.com/errhythm/ccswap) that adds a Codex desktop restart around Codex switches (`codex.restartDesktop`, macOS) and setup-token usage via Claude Code's `/usage`. Install it with `uv tool install --with rumps git+https://github.com/seungminkangg/ccswap@main`; `ccswap upgrade` then follows this fork.
+> **Fork note.** This is a fork of [errhythm/ccswap](https://github.com/errhythm/ccswap) that adds a Codex desktop restart around Codex switches (`codex.restartDesktop`, macOS), an opt-in continuation of threads the usage limit stopped (`codex.resumeAfterRestart`), and setup-token usage via Claude Code's `/usage`. Install it with `uv tool install --managed-python --with rumps git+https://github.com/seungminkangg/ccswap@main` (a managed Python so the menu bar icon draws); `ccswap upgrade` then follows this fork.
 
 Multi-account and usage manager for Claude Code and OpenAI Codex. Save multiple logins, check their quota windows, switch manually or automatically before you hit a rate limit, and manage both providers from one dashboard.
 
