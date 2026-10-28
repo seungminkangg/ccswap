@@ -193,7 +193,7 @@ def test_already_selected_account_leaves_the_app_alone(accounts, mac):
 
 @pytest.mark.parametrize("turns, written_ago, detail", [
     ((("inProgress", NOW - 60),), 3600, "1 Codex turn(s) in progress"),
-    ((("completed", NOW - 30),), 5, "active"),
+    ((("completed", NOW - 30),), 3600, "was active"),
 ])
 def test_busy_desktop_waits_without_touching_anything(accounts, mac, turns, written_ago, detail):
     switcher, home = accounts
@@ -207,6 +207,19 @@ def test_busy_desktop_waits_without_touching_anything(accounts, mac, turns, writ
     assert not result["switched"] and result["reason"] == "desktop-busy"
     assert detail in result["message"]
     assert mac.calls == [] and _live(home) == before
+
+
+def test_history_file_touched_without_recent_turns_counts_as_idle(accounts, mac):
+    # The app writes the history database about once a minute even when idle;
+    # with a 60 s poll that mtime alone kept auto-switch waiting forever.
+    switcher, home = accounts
+    (home / "thread_history_1.sqlite").unlink()
+    _history(home, ("completed", NOW - 3600), written_ago=5)
+    mac.start_app()
+
+    result = switcher.switch_to("1", json_output=True)
+
+    assert result["switched"] and result["desktop"]["state"] == "restarted"
 
 
 def test_stale_in_progress_turn_from_a_previous_launch_is_ignored(accounts, mac):

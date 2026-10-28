@@ -55,7 +55,7 @@ BUNDLE_ID = "com.openai.codex"
 MARKER_FILENAME = "desktop_handoff.json"
 QUIT_TIMEOUT_S = 30.0
 LAUNCH_TIMEOUT_S = 30.0
-# Thread history written this recently counts as activity even without an
+# A turn that started or ended this recently counts as activity even without an
 # inProgress row (covers a projection that has not caught up yet).
 QUIET_S = 60.0
 _POLL_S = 0.5
@@ -257,8 +257,10 @@ def desktop_activity(home: Path, since: float, now: float | None = None) -> tupl
     try:
         con = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2)
         try:
-            (count,) = con.execute(
-                "SELECT COUNT(*) FROM thread_turns WHERE status = 'inProgress' AND started_at >= ?",
+            count, last = con.execute(
+                "SELECT SUM(status = 'inProgress' AND started_at >= ?),"
+                " MAX(MAX(COALESCE(started_at, 0)), MAX(COALESCE(completed_at, 0)))"
+                " FROM thread_turns",
                 (int(since),),
             ).fetchone()
         finally:
@@ -267,16 +269,10 @@ def desktop_activity(home: Path, since: float, now: float | None = None) -> tupl
         return "unknown", f"Codex thread history unreadable ({exc.__class__.__name__})"
     if count:
         return "busy", f"{count} Codex turn(s) in progress"
-    written = 0.0
-    for path in (db, db.with_name(db.name + "-wal")):
-        try:
-            written = max(written, path.stat().st_mtime)
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            return "unknown", f"Codex thread history unreadable ({exc.__class__.__name__})"
-    if now - written < QUIET_S:
-        return "busy", f"Codex was active {max(0, int(now - written))}s ago"
+    # Turn timestamps, not the file's mtime: the app touches the history
+    # database about once a minute even with nothing running.
+    if last and now - last < QUIET_S:
+        return "busy", f"Codex was active {max(0, int(now - last))}s ago"
     return "idle", ""
 
 
