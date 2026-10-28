@@ -20,9 +20,9 @@ back. The handoff here is:
 
 Only an idle app is restarted, so no running turn is cut off. Threads whose
 last turn the usage limit had already stopped are continued afterwards only with
-``codex.resumeAfterRestart``: each such turn gets one ``continue`` through the
-bundled ``codex exec resume`` (the desktop's own app-server takes no outside
-clients), recorded first so it is never sent twice. A small marker file
+``codex.resumeAfterRestart``: each such turn gets one ``continue`` queued with
+the bundled ``codex queue`` and the thread opened by deep link, so the app
+itself sends it; recorded first so it is never sent twice. A small marker file
 records an in-flight handoff (bundle path and slot numbers only, no secrets) so
 an interrupted ccswap reopens the app once instead of leaving it closed.
 """
@@ -63,6 +63,7 @@ RESUME_PROMPT = "continue"
 RESUME_WINDOW_S = 6 * 3600.0  # Older limit stops are left to the user.
 RESUME_MAX = 5  # Threads per restart; each one spends the new account's quota.
 RESUME_LEDGER = "resumed_turns.json"
+RESUME_TAKE_S = 20.0  # How long one thread may take to leave the queue.
 _LEDGER_KEEP_S = 7 * 86400.0
 
 
@@ -347,11 +348,11 @@ def _query(db: Path, sql: str, args: tuple) -> list[tuple]:
         con.close()
 
 
-def stopped_threads(home: Path, now: float | None = None) -> list[tuple[str, str, str, list[str]]]:
-    """(thread, turn, cwd, model args) whose latest turn hit the usage limit recently.
+def stopped_threads(home: Path, now: float | None = None) -> list[tuple[str, str]]:
+    """(thread, turn) whose latest turn hit the usage limit recently.
 
     Archived and subagent threads are left alone; a subagent is continued by
-    its parent. The thread's own model and effort are kept, not config.toml's.
+    its parent.
     """
     now = time.time() if now is None else now
     history, state = _latest_db(home, "thread_history"), _latest_db(home, "state")
@@ -365,18 +366,10 @@ def stopped_threads(home: Path, now: float | None = None) -> list[tuple[str, str
           AND t.rollout_ordinal = (SELECT MAX(rollout_ordinal) FROM thread_turns
                                    WHERE thread_id = t.thread_id)
         ORDER BY t.completed_at DESC""", (int(now - RESUME_WINDOW_S),))
-    found = []
-    for thread, turn in turns:
-        row = _query(state, """
-            SELECT cwd, model, reasoning_effort FROM threads
-            WHERE id = ? AND archived = 0 AND source NOT LIKE '%"subagent"%'
-              AND COALESCE(thread_source, '') != 'agent_created_thread'""", (thread,))
-        if row:
-            cwd, model, effort = row[0]
-            args = [*(["-m", model] if model else []),
-                    *(["-c", f"model_reasoning_effort={effort}"] if effort else [])]
-            found.append((thread, turn, cwd, args))
-    return found
+    return [(thread, turn) for thread, turn in turns if _query(state, """
+        SELECT 1 FROM threads
+        WHERE id = ? AND archived = 0 AND source NOT LIKE '%"subagent"%'
+          AND COALESCE(thread_source, '') != 'agent_created_thread'""", (thread,))]
 
 
 def _bundled_cli(bundle: str) -> str | None:
@@ -385,8 +378,22 @@ def _bundled_cli(bundle: str) -> str | None:
     return str(cli) if cli.is_file() else shutil.which("codex")
 
 
+def _queued(home: Path, thread: str) -> bool:
+    db = _latest_db(home, "queue")
+    try:
+        return db is not None and bool(_query(
+            db, "SELECT 1 FROM queued_items WHERE thread_id = ? LIMIT 1", (thread,)))
+    except sqlite3.Error:
+        return False
+
+
 def resume_stopped(switcher: CodexAccountSwitcher, bundle: str) -> list[str]:
-    """Send one ``continue`` to each limit-stopped thread; return thread ids."""
+    """Continue each limit-stopped thread inside the desktop app; return thread ids.
+
+    ``continue`` goes into the app's own message queue and the thread is opened
+    with a background deep link, so the app sends it and the turn stays visible
+    and controllable there (a separate ``codex exec`` would lock the thread).
+    """
     ledger_path = switcher.provider_dir / RESUME_LEDGER
     try:
         ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
@@ -395,27 +402,31 @@ def resume_stopped(switcher: CodexAccountSwitcher, bundle: str) -> list[str]:
     now = time.time()
     ledger = {turn: at for turn, at in (ledger.items() if isinstance(ledger, dict) else ())
               if isinstance(at, (int, float)) and now - at < _LEDGER_KEEP_S}
-    todo = [t for t in stopped_threads(switcher.codex_home, now) if t[1] not in ledger]
+    home = switcher.codex_home
+    todo = [t for t in stopped_threads(home, now) if t[1] not in ledger]
     cli = _bundled_cli(bundle)
     if not todo or cli is None:
         return []
-    started = []
-    for thread, turn, cwd, model_args in todo[:RESUME_MAX]:
+    env = {**os.environ, "CODEX_HOME": str(home)}
+    sent = []
+    for thread, turn in todo[:RESUME_MAX]:
         ledger[turn] = now
         atomic_write_json(ledger_path, ledger)  # Recorded before sending: at most once.
         try:
-            subprocess.Popen(
-                [cli, "exec", "--skip-git-repo-check", "resume", *model_args,
-                 thread, RESUME_PROMPT],
-                cwd=cwd if os.path.isdir(cwd) else str(Path.home()),
-                env={**os.environ, "CODEX_HOME": str(switcher.codex_home)},
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, start_new_session=True,
-            )
-        except OSError:
+            subprocess.run([cli, "queue", "--thread", thread, "--message", RESUME_PROMPT],
+                           env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                           timeout=LAUNCH_TIMEOUT_S, check=True)
+            subprocess.run(["open", "-g", f"codex://threads/{thread}"],
+                           capture_output=True, timeout=LAUNCH_TIMEOUT_S, check=True)
+        except (OSError, subprocess.SubprocessError):
+            _logger.warning("could not queue a continue for a limit-stopped Codex thread")
             continue
-        started.append(thread)
-    return started
+        sent.append(thread)
+        # Let the app take this one before the next deep link moves it on.
+        deadline = time.monotonic() + RESUME_TAKE_S
+        while _queued(home, thread) and time.monotonic() < deadline:
+            time.sleep(_POLL_S)
+    return sent
 
 
 # ---- handoff marker ---------------------------------------------------------
@@ -615,8 +626,8 @@ def switch_with_desktop(
             except (OSError, sqlite3.Error):
                 _logger.warning("resuming stopped Codex threads failed", exc_info=True)
             if resumed:
-                message += (f" Continuing {len(resumed)} thread(s) the usage limit stopped; "
-                            "let them finish before typing in them.")
+                message += (f" Continuing {len(resumed)} thread(s) the usage limit stopped "
+                            "in Codex desktop.")
         result["desktop"] = {"state": state, "message": message, "bundle": app.bundle,
                              **({"recovered": recovered} if recovered else {}),
                              **({"resumed": resumed} if resumed else {})}

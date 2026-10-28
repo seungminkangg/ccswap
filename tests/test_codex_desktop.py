@@ -87,6 +87,8 @@ class FakeMac:
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[0] == "pgrep":  # _codex_restart_hint's liveness probe
             return subprocess.CompletedProcess(argv, 1, b"", b"")
+        if argv[0] == "/fake/codex" or argv[:2] == ["open", "-g"]:  # resume: queue + deep link
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
         if argv[0] == "open":
             if not self.launch_ok:
                 raise subprocess.CalledProcessError(1, argv)
@@ -639,15 +641,14 @@ def _threads(home, *rows, written_ago: float = 3600) -> None:
 
 
 @pytest.fixture
-def popen(monkeypatch):
-    calls = []
+def sent(mac, monkeypatch):
+    """Resume commands the fake Mac received: (codex queue argv, deep link argv) pairs."""
     monkeypatch.setattr(codex_desktop, "_bundled_cli", lambda bundle: "/fake/codex")
-    monkeypatch.setattr(codex_desktop.subprocess, "Popen",
-                        lambda argv, **kw: calls.append((argv, kw)))
-    return calls
+    calls = mac.calls
+    return lambda: [c for c in calls if c[0] == "/fake/codex" or c[:2] == ["open", "-g"]]
 
 
-def test_restart_resumes_limit_stopped_threads_once(accounts, mac, popen):
+def test_restart_resumes_limit_stopped_threads_once(accounts, mac, sent):
     switcher, home = accounts
     set_setting(switcher.backup_dir, "codex.resumeAfterRestart", "true")
     _threads(home,
@@ -668,17 +669,32 @@ def test_restart_resumes_limit_stopped_threads_once(accounts, mac, popen):
     assert result["desktop"]["state"] == "restarted"
     assert result["desktop"]["resumed"] == ["stopped"]
     assert "Continuing 1 thread" in result["desktop"]["message"]
-    (argv, kw), = popen
-    assert argv == ["/fake/codex", "exec", "--skip-git-repo-check", "resume",
-                    "-m", "gpt-test", "-c", "model_reasoning_effort=high", "stopped", "continue"]
-    assert kw["cwd"] == str(home) and kw["env"]["CODEX_HOME"] == str(home)
-    assert kw["start_new_session"] and kw["stdout"] is subprocess.DEVNULL
+    # Queued in the app's own queue, then opened there; no separate `codex exec`.
+    assert sent() == [["/fake/codex", "queue", "--thread", "stopped", "--message", "continue"],
+                      ["open", "-g", "codex://threads/stopped"]]
 
     switcher.switch_to("2", json_output=True)  # Same stopped turn: never sent twice.
-    assert len(popen) == 1
+    assert len(sent()) == 2
 
 
-def test_resume_is_off_by_default(accounts, mac, popen):
+def test_resume_waits_for_the_app_to_take_each_thread(accounts, mac, sent, monkeypatch):
+    switcher, home = accounts
+    set_setting(switcher.backup_dir, "codex.resumeAfterRestart", "true")
+    _threads(home, ("a", 0, "failed", LIMIT, 600, {}), ("b", 0, "failed", LIMIT, 500, {}))
+    queue = sqlite3.connect(home / "queue_1.sqlite")
+    queue.execute("CREATE TABLE queued_items (thread_id TEXT)")
+    queue.execute("INSERT INTO queued_items VALUES ('b')")  # The app has not taken b yet.
+    queue.commit()
+    queue.close()
+    monkeypatch.setattr(codex_desktop, "RESUME_TAKE_S", 0.2)
+    mac.start_app()
+
+    result = switcher.switch_to("1", json_output=True)
+
+    assert result["desktop"]["resumed"] == ["b", "a"]  # Newest stop first; b's wait timed out.
+
+
+def test_resume_is_off_by_default(accounts, mac, sent):
     switcher, home = accounts
     _threads(home, ("stopped", 0, "failed", LIMIT, 600, {}))
     mac.start_app()
@@ -686,10 +702,10 @@ def test_resume_is_off_by_default(accounts, mac, popen):
     result = switcher.switch_to("1", json_output=True)
 
     assert result["desktop"]["state"] == "restarted" and "resumed" not in result["desktop"]
-    assert popen == []
+    assert sent() == []
 
 
-def test_no_resume_without_a_confirmed_restart(accounts, mac, popen):
+def test_no_resume_without_a_confirmed_restart(accounts, mac, sent):
     switcher, home = accounts
     set_setting(switcher.backup_dir, "codex.resumeAfterRestart", "true")
     _threads(home, ("stopped", 0, "failed", LIMIT, 600, {}))
@@ -698,7 +714,7 @@ def test_no_resume_without_a_confirmed_restart(accounts, mac, popen):
 
     result = switcher.switch_to("1", json_output=True)
 
-    assert result["desktop"]["state"] == "relaunch-failed" and popen == []
+    assert result["desktop"]["state"] == "relaunch-failed" and sent() == []
 
 
 def test_only_one_live_codex_engine_runs(accounts, monkeypatch):
