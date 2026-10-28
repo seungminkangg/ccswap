@@ -252,12 +252,18 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
     below is the scan-shaped view that drops it.
     """
     sessions_dir = (claude_dir or get_claude_dir()) / "sessions"
-    if not sessions_dir.is_dir():
+    try:
+        # glob/is_dir may suppress filesystem errors: uncertainty must block guards.
+        paths = [path for path in sessions_dir.iterdir() if path.match("*.json")]
+    except FileNotFoundError:
         return [], 0
+    except OSError as exc:
+        logger.debug("Cannot enumerate session directory %s: %s", sessions_dir, exc)
+        return [], 1
 
     sessions = []
     unreadable = 0
-    for path in sessions_dir.glob("*.json"):
+    for path in paths:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             pid = data["pid"]

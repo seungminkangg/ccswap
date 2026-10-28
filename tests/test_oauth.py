@@ -1529,7 +1529,8 @@ class TestConsumeBusyIsDeterministic:
     spending a request per pass to learn nothing.
     """
 
-    def test_a_busy_gate_does_not_spend_a_doomed_request(self):
+    @pytest.mark.parametrize("kind", ["consume-busy", "session-unreadable"])
+    def test_a_deferred_gate_does_not_spend_a_doomed_request(self, kind):
         creds = json.dumps({
             "claudeAiOauth": {
                 "accessToken": "expired",
@@ -1540,9 +1541,9 @@ class TestConsumeBusyIsDeterministic:
         with patch("claude_swap.oauth.request_usage_data") as usage:
             out = oauth.try_fetch_usage_for_account(
                 "1", "a@example.com", creds, is_active=False,
-                refresh_via=lambda *_: oauth.RefreshOutcome(None, "consume-busy"),
+                refresh_via=lambda *_: oauth.RefreshOutcome(None, kind),
             )
-        assert out.error == "consume-busy", out.error
+        assert out.error == kind, out.error
         usage.assert_not_called()
 
     def test_every_deterministic_kind_has_a_note(self):

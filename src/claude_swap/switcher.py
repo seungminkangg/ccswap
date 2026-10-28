@@ -14,6 +14,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from stat import S_ISDIR
 
 from claude_swap import macos_keychain
 
@@ -223,6 +224,9 @@ ERROR_NOTES = {
     "stash-unreadable": (
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `ccswap unclaimed` inspects it"
+    ),
+    "session-unreadable": (
+        "session state could not be read — restore access and retry"
     ),
 }
 
@@ -997,12 +1001,14 @@ class ClaudeAccountSwitcher:
         worse than the drift caveat — but gets a stale marker so setup_session
         re-bootstraps it once it is no longer live.
         """
-        if self._live_session_pids(account_num, email):
-            from claude_swap.session import mark_session_stale
+        from claude_swap.session import mark_session_stale, scan_live_sessions
 
-            if not mark_session_stale(self._session_dir(account_num, email)):
+        session_dir = self._session_dir(account_num, email)
+        sessions, unreadable = scan_live_sessions(session_dir)
+        if sessions or unreadable:
+            if not mark_session_stale(session_dir):
                 self._logger.error(
-                    "Account %s's backup credentials changed but its live "
+                    "Account %s's backup credentials changed but its live or unreadable "
                     "session profile could not be marked stale; it may keep "
                     "serving the superseded generation once it exits.",
                     account_num,
@@ -2370,6 +2376,7 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import (
             is_session_stale,
             read_session_credentials,
+            scan_live_sessions,
             session_dir_for,
             session_identity_drifted,
         )
@@ -2451,8 +2458,15 @@ class ClaudeAccountSwitcher:
                     .get("organizationUuid", "")
                     or ""
                 )
-                if not self._live_session_pids(account_num, email):
-                    sdir = session_dir_for(self.backup_dir, account_num, email)
+                sdir = session_dir_for(self.backup_dir, account_num, email)
+                sessions, unreadable = scan_live_sessions(sdir)
+                if unreadable:
+                    self._logger.info(
+                        "Account %s's session state could not be read; "
+                        "deferring the refresh. Restore access and retry.", account_num,
+                    )
+                    return oauth.RefreshOutcome(None, "session-unreadable")
+                if not sessions:
                     profile = read_session_credentials(sdir)
                     if (
                         profile
@@ -3006,22 +3020,22 @@ class ClaudeAccountSwitcher:
         """
         from claude_swap.session import scan_live_sessions
 
-        pids = self._live_session_pids(account_num, email)
+        session_dir = self._session_dir(account_num, email)
+        sessions, unreadable = scan_live_sessions(session_dir)
+        pids = [s.pid for s in sessions]
         if pids:
             raise SessionError(
                 f"Account-{account_num} ({email}) has a live session-mode Claude "
                 f"instance (PID {', '.join(map(str, pids))}). "
                 f"Exit it first, then retry {action}."
             )
-        session_dir = self._session_dir(account_num, email)
-        _, unreadable = scan_live_sessions(session_dir)
         if unreadable:
             raise SessionError(
-                f"Account-{account_num} ({email}) has {unreadable} session "
-                f"record(s) that could not be read, so whether a Claude "
+                f"Account-{account_num} ({email}) has session state that could not be read "
+                f"({unreadable} unreadable record(s) or directory errors), so whether a Claude "
                 f"instance is live cannot be determined. Inspect "
-                f"{session_dir / 'sessions'} and remove or repair them, then "
-                f"retry {action}."
+                f"{session_dir / 'sessions'} and restore access or repair invalid records, "
+                f"then retry {action}. Do not remove records while Claude may still be running."
             )
 
     def _invalidate_session_credentials(self, account_num: str, email: str) -> None:
@@ -7872,11 +7886,32 @@ class ClaudeAccountSwitcher:
         # Refuse while any session-mode claude is running: purging would pull
         # its profile (and keychain entry) out from under a live process.
         sessions_root = self.backup_dir / "sessions"
-        session_dirs = (
-            [d for d in sessions_root.iterdir() if d.is_dir()]
-            if sessions_root.is_dir()
-            else []
-        )
+        try:
+            root_is_dir = S_ISDIR(sessions_root.stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            root_is_dir = False
+        except OSError as exc:
+            raise SessionError(
+                f"Session root {sessions_root} could not be read. "
+                "Restore access, then retry --purge."
+            ) from exc
+        session_dirs = []
+        if root_is_dir:
+            try:
+                # Inspect every child explicitly: is_dir can suppress stat errors.
+                for d in sessions_root.iterdir():
+                    try:
+                        mode = d.stat().st_mode
+                    except FileNotFoundError:
+                        # It disappeared, or is a symlink whose target is gone.
+                        continue
+                    if S_ISDIR(mode):
+                        session_dirs.append(d)
+            except OSError as exc:
+                raise SessionError(
+                    f"Session profiles under {sessions_root} could not be read. "
+                    "Restore access, then retry --purge."
+                ) from exc
         from claude_swap.session import scan_live_sessions
 
         live = {}
@@ -7903,8 +7938,9 @@ class ClaudeAccountSwitcher:
             raise SessionError(
                 f"Session records that could not be read: {details}. Whether a "
                 "Claude instance is live cannot be determined, and purging "
-                "would pull a live profile out from under it. Repair or remove "
-                "them, then retry --purge."
+                "would pull a live profile out from under it. Restore access or "
+                "repair invalid records, then retry --purge. Do not remove "
+                "records while Claude may still be running."
             )
 
         warning("This will remove ALL claude-swap data from your system:")

@@ -513,8 +513,6 @@ def scan_live_sessions(session_dir: Path) -> tuple[list[ClaudeSession], int]:
     old name returned a bare list, and a call site left on it would read a
     tuple as unconditionally truthy.
     """
-    if not session_dir.exists():
-        return [], 0
     return scan_sessions(claude_dir=session_dir)
 
 

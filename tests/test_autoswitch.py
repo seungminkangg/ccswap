@@ -7027,29 +7027,22 @@ class TestFreshenRoutesThroughGate:
             "transient bucket and reads as (network?)"
         )
 
-    def test_unreadable_stash_is_not_reported_as_network_trouble(
-        self, temp_home
+    @pytest.mark.parametrize("kind", ["stash-unreadable", "session-unreadable"])
+    def test_unreadable_state_is_not_reported_as_network_trouble(
+        self, temp_home, kind
     ):
-        """A permanently unreadable stash row is local and needs a human.
-
-        The row is the sole copy of a generation the slot already consumed, so
-        the gate defers on every pass — correctly, since nothing on disk tells
-        a keychain locked for a minute from one locked forever. But an
-        unrecognised kind maps to "transient", and the tick then renders
-        "could not freshen any candidate (network?)" forever, on a condition
-        no network change can affect and only the operator can clear.
-        """
+        """Unreadable local state needs repair, rather than network retries."""
         from claude_swap import oauth as oauth_mod
 
         harness = EngineHarness(temp_home)
         harness.seed(2, "b@example.com", expires_at=1)
         with patch.object(
             harness.switcher, "consume_backup_grant",
-            return_value=oauth_mod.RefreshOutcome(None, "stash-unreadable"),
+            return_value=oauth_mod.RefreshOutcome(None, kind),
         ):
             status = harness.engine._freshen_target("2", "b@example.com")
-        assert status == "stash-unreadable", (
-            f"got {status!r}: an unreadable stash row falls into the "
+        assert status == kind, (
+            f"got {status!r}: unreadable local state falls into the "
             "transient bucket and reads as (network?)"
         )
 
@@ -7066,8 +7059,12 @@ class TestFreshenRoutesThroughGate:
             status = harness.engine._freshen_target("2", "b@example.com")
         assert status == "store-unmirrored"
 
+    @pytest.mark.parametrize("kind,remedy", [
+        ("store-unmirrored", "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+        ("session-unreadable", "Restore access"),
+    ])
     def test_an_actionable_cause_is_not_hidden_by_a_self_clearing_one(
-        self, temp_home
+        self, temp_home, kind, remedy
     ):
         """The tick reports ONE systemic cause, and it must be the actionable one.
 
@@ -7086,7 +7083,7 @@ class TestFreshenRoutesThroughGate:
 
         # Slot 2 needs a human (an env var is set); slot 3 clears itself.
         def by_slot(num, email, *a, **kw):
-            return "store-unmirrored" if num == "2" else "consume-busy"
+            return kind if num == "2" else "consume-busy"
 
         with patch.object(
             h.engine, "_freshen_target", side_effect=by_slot
@@ -7100,7 +7097,7 @@ class TestFreshenRoutesThroughGate:
         errors = [e for e in h.events if getattr(e, "message", None)]
         assert errors, f"no error event; got kinds {h.kinds()}"
         msg = errors[-1].message
-        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in msg, (
+        assert remedy in msg, (
             f"got {msg!r}: the self-clearing cause hid the one needing a human"
         )
 
