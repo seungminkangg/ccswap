@@ -409,3 +409,20 @@ def test_best_ranks_candidates_by_distance_to_their_gates(tmp_path, monkeypatch)
     # Polls continue reporting real quota headroom, not policy-adjusted values.
     assert events[0].headroom["2"] == 60
     assert events[0].headroom["3"] == 50
+
+
+def test_all_exhausted_reports_the_earliest_weekly_reset(tmp_path):
+    switcher = FakeCodexSwitcher(tmp_path, (
+        _weekly_account("1", 100, 5000, active=True, weekly_pct=100),
+        _weekly_account("2", 100, 3000, weekly_pct=100),
+        _weekly_account("3", 100, None, weekly_pct=100),
+    ))
+    events = []
+    engine = CodexAutoSwitchEngine(
+        switcher, AutoSwitchSettings(threshold=90), events.append, clock=lambda: 1000
+    )
+
+    assert engine.tick() is TickOutcome.BLOCKED
+
+    assert events[-1].kind == "all-exhausted"
+    assert events[-1].earliest_reset_at == "1970-01-01T00:50:00Z"

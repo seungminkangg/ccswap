@@ -13,6 +13,7 @@ import json
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import oauth
@@ -250,7 +251,11 @@ class CodexAutoSwitchEngine:
                 candidate_headroom is not None and candidate_headroom <= 0
                 for candidate_headroom in (headroom[account.number] for account in candidates)
             ):
-                self._emit(AllExhaustedEvent(earliest_reset_at=None))
+                known = [ts for ts in resets.values() if ts is not None]
+                self._emit(AllExhaustedEvent(earliest_reset_at=(
+                    datetime.fromtimestamp(min(known), timezone.utc)
+                    .isoformat().replace("+00:00", "Z") if known else None
+                )))
             else:
                 self._emit(NoSwitchEvent(reason="no-qualifying-candidate"))
             return TickOutcome.BLOCKED
