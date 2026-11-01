@@ -392,7 +392,7 @@ def is_codex_running() -> bool:
             return b"codex.exe" in completed.stdout.lower()
         # pgrep -x matches the executable name exactly, so it won't fire on
         # ccswap itself or on unrelated paths that merely contain "codex".
-        completed = subprocess.run(
+        completed = spawn.run(
             ["pgrep", "-x", "codex"],
             capture_output=True,
             text=True,

@@ -107,8 +107,9 @@ def mac(monkeypatch):
     monkeypatch.setattr(codex_desktop, "_ps", lambda: list(fake.procs))
     monkeypatch.setattr(codex_desktop, "_env_codex_home",
                         lambda pid: (True, fake.env.get(pid)))
-    monkeypatch.setattr(codex_desktop.subprocess, "run",
-                        lambda argv, **kw: (fake.run_override or fake.run)(argv, **kw))
+    run = lambda argv, **kw: (fake.run_override or fake.run)(argv, **kw)  # noqa: E731
+    monkeypatch.setattr(codex_desktop.subprocess, "run", run)
+    monkeypatch.setattr(codex_desktop.spawn, "run", run)  # The fake sees the bare argv.
     monkeypatch.setattr(
         codex_desktop, "_bundle_info",
         lambda bundle: (codex_desktop.BUNDLE_ID, "ChatGPT") if bundle.endswith("ChatGPT.app")
@@ -758,3 +759,21 @@ def test_only_one_live_codex_engine_runs(accounts, monkeypatch):
     finally:
         holder.release()
     assert not autoswitch.live_engine_running(switcher.backup_dir, "codex")
+
+
+def test_polled_process_scan_takes_the_no_fork_spawn_path(monkeypatch):
+    # The menu bar scans every refresh; a forked ps re-arms libmalloc's
+    # MallocStackLogging hook and spams its stderr log (claude-swap #517).
+    from claude_swap import spawn
+
+    calls = []
+    monkeypatch.setattr(spawn.sys, "platform", "darwin")
+    monkeypatch.setattr(spawn, "_inheritable_fds_above_stdio", lambda: False)
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: calls.append(
+        (argv, kw)) or subprocess.CompletedProcess(argv, 0, "", ""))
+
+    codex_desktop._ps()
+
+    (argv, kw), = calls
+    assert os.path.isabs(argv[0]) and argv[1:3] == ["-axww", "-o"]
+    assert kw["close_fds"] is False

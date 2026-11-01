@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from claude_swap import spawn
 from claude_swap.exceptions import SwitchError
 from claude_swap.locking import FileLock
 from claude_swap.settings import atomic_write_json
@@ -114,7 +115,7 @@ class DesktopScan:
 # ---- process inspection --------------------------------------------------
 
 def _ps() -> list[Proc]:
-    out = subprocess.run(
+    out = spawn.run(
         ["ps", "-axww", "-o", "pid=,ppid=,uid=,lstart=,comm="],
         capture_output=True, text=True, check=True, timeout=10,
         env={**os.environ, "LC_ALL": "C"},
@@ -290,7 +291,7 @@ def quit_app(app: DesktopApp, timeout: float | None = None) -> str | None:
     """
     timeout = QUIT_TIMEOUT_S if timeout is None else timeout
     try:
-        done = subprocess.run(
+        done = spawn.run(
             ["osascript", "-e", "on run argv", "-e", "tell application (item 1 of argv) to quit",
              "-e", "end run", app.bundle],
             capture_output=True, text=True, timeout=timeout,
@@ -320,7 +321,7 @@ def launch_app(bundle: str, home: Path, timeout: float | None = None) -> Desktop
     timeout = LAUNCH_TIMEOUT_S if timeout is None else timeout
     before = {(a.pid, a.started) for a in scan_desktop(home).apps}
     try:
-        subprocess.run(["open", bundle], capture_output=True, timeout=timeout, check=True)
+        spawn.run(["open", bundle], capture_output=True, timeout=timeout, check=True)
     except (OSError, subprocess.SubprocessError):
         return None
     deadline = time.monotonic() + timeout
@@ -409,10 +410,10 @@ def resume_stopped(switcher: CodexAccountSwitcher, bundle: str) -> list[str]:
         ledger[turn] = now
         atomic_write_json(ledger_path, ledger)  # Recorded before sending: at most once.
         try:
-            subprocess.run([cli, "queue", "--thread", thread, "--message", RESUME_PROMPT],
+            spawn.run([cli, "queue", "--thread", thread, "--message", RESUME_PROMPT],
                            env=env, stdin=subprocess.DEVNULL, capture_output=True,
                            timeout=LAUNCH_TIMEOUT_S, check=True)
-            subprocess.run(["open", "-g", f"codex://threads/{thread}"],
+            spawn.run(["open", "-g", f"codex://threads/{thread}"],
                            capture_output=True, timeout=LAUNCH_TIMEOUT_S, check=True)
         except (OSError, subprocess.SubprocessError):
             _logger.warning("could not queue a continue for a limit-stopped Codex thread")
