@@ -211,6 +211,8 @@ def export_accounts(
 
         if is_active:
             creds_text = switcher._read_credentials()
+            if creds_text:
+                creds_text = switcher._slot_live_credential(num, creds_text)
             if not creds_text:
                 raise CredentialReadError(
                     f"failed to read live credentials for active account {email}"

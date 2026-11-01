@@ -1,6 +1,6 @@
 """Run the menu bar from inside a wrapper ``.app`` so the process has a bundle ID.
 
-``ccswap menubar`` is a console script: the process macOS sees is a bare Python
+``cswap menubar`` is a console script: the process macOS sees is a bare Python
 interpreter somewhere under ``~/.local/share/uv`` (or a pipx venv), and
 ``NSRunningApplication.bundleIdentifier`` for it is nil. Menu bar managers key
 every status item by that identifier (Dimble, Ice, Bartender, SaneBar all do),
@@ -23,7 +23,7 @@ interpreter must physically live under ``Contents/MacOS`` (a symlink resolves to
 the original and keeps the nil identity; a copy is ~20 MB, once). CPython then
 finds ``pyvenv.cfg`` one directory up and treats ``Contents`` as its venv:
 ``home`` points it at the stdlib, the ``lib`` links at the installed packages.
-So the copy runs the very same ccswap, just under a name macOS can see.
+So the copy runs the very same claude-swap, just under a name macOS can see.
 
 ``Contents/lib`` is a real directory, not a symlink to the venv's ``lib``: many
 managed interpreters (uv's CPython 3.12/3.13, for one) are small stubs linked
@@ -44,7 +44,7 @@ down with the hidden ones (fif7y/dimble#30 traced the same failure for iStat
 Menus). When ``/Applications`` is not writable the bundle falls back to the data
 directory: the menu bar still works, managers just cannot keep it visible.
 
-The bundle is rebuilt (cheaply: only what changed) on every ``ccswap menubar``
+The bundle is rebuilt (cheaply: only what changed) on every ``cswap menubar``
 start and the process re-execs into it before AppKit loads. ``uv tool
 --reinstall`` recreating the venv or a managed-Python version bump therefore
 never leaves a stale bundle behind, and launchd keeps the same pid throughout.

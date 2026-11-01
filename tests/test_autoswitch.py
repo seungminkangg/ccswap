@@ -7,6 +7,7 @@ import os
 import threading
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -7187,6 +7188,49 @@ class TestPerGateThresholds:
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
 
+    def test_weekly_threshold_alias_sets_the_weekly_gate(self, temp_home):
+        h = self._seed(temp_home, weekly_threshold=60.0)
+        outcome = h.tick_with_usage({
+            "1": _windows(10, 70),
+            "2": _windows(10, 10),
+            "3": _windows(20, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_threshold_7d_outranks_the_weekly_threshold_alias(self, temp_home):
+        # weeklyThreshold 99 alone would hold 7d at 96; threshold7d 95 wins.
+        h = self._seed(
+            temp_home, threshold_5h=95.0, weekly_threshold=99.0, threshold_7d=95.0
+        )
+        outcome = h.tick_with_usage({
+            "1": _windows(10, 96),
+            "2": _windows(10, 10),
+            "3": _windows(20, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+
+    def test_weekly_threshold_alias_covers_model_windows(self, temp_home):
+        h = self._seed(temp_home, model="Fable", weekly_threshold=60.0)
+        outcome = h.tick_with_usage({
+            "1": _windows(5, 5, 65),
+            "2": _windows(5, 5, 10),
+            "3": _windows(20, 20, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_model_threshold_outranks_the_weekly_threshold_alias(self, temp_home):
+        h = self._seed(
+            temp_home, model="Fable", weekly_threshold=60.0, model_thresholds="Fable=70"
+        )
+        outcome = h.tick_with_usage({
+            "1": _windows(5, 5, 65),
+            "2": _windows(5, 5, 10),
+            "3": _windows(20, 20, 20),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+
     def test_fable_gate_trips_without_autoswitch_model(self, temp_home):
         h = self._seed(temp_home, model_thresholds="Fable=40")
         outcome = h.tick_with_usage({
@@ -7266,4 +7310,43 @@ class TestPerGateThresholds:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
+
+
+
+class TestOptionalWarmup:
+    def test_default_off_never_constructs_warmup(self, harness, monkeypatch):
+        monkeypatch.setattr("claude_swap.warmup.WarmupEngine", lambda *a: pytest.fail("warmup"))
+        monkeypatch.setattr(harness.engine, "_tick_inner", lambda: TickOutcome.NO_ACTION)
+        assert harness.engine.tick() == TickOutcome.NO_ACTION
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_enabled_warmup_receives_dry_run_and_reports_events(self, harness, monkeypatch, dry_run):
+        harness.engine.settings = replace(harness.engine.settings, warmup_five_hour=True)
+        harness.engine.dry_run = dry_run
+        calls = []
+
+        class FakeWarmup:
+            def __init__(self, switcher, clock, report, enabled):
+                assert enabled()
+                self.report = report
+
+            def tick(self, **kwargs):
+                calls.append(kwargs)
+                self.report("test warmup result")
+
+        monkeypatch.setattr("claude_swap.warmup.WarmupEngine", FakeWarmup)
+        monkeypatch.setattr(harness.engine, "_tick_inner", lambda: TickOutcome.NO_ACTION)
+        assert harness.engine.tick() == TickOutcome.NO_ACTION
+        assert calls == [{"dry_run": dry_run}]
+        event = harness.events[-1]
+        assert event.kind == "warmup"
+        assert event.to_json()["message"] == "test warmup result"
+        assert event.human() == "test warmup result"
+
+    def test_warmup_failure_preserves_switch_result(self, harness, monkeypatch):
+        harness.engine.settings = replace(harness.engine.settings, warmup_five_hour=True)
+        harness.engine._warmup = SimpleNamespace(tick=lambda **kwargs: 1 / 0)
+        monkeypatch.setattr(harness.engine, "_tick_inner", lambda: TickOutcome.NO_ACTION)
+        assert harness.engine.tick() == TickOutcome.NO_ACTION
+        assert harness.events[-1].kind == "warmup"
 

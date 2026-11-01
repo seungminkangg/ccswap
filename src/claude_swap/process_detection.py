@@ -20,6 +20,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from claude_swap import spawn
 from claude_swap.paths import get_claude_config_home
 
 logger = logging.getLogger(__name__)
@@ -114,7 +115,7 @@ def _ps(pid: int, *columns: str) -> str | None:
     if sys.platform == "win32":
         return None
     try:
-        proc = subprocess.run(
+        proc = spawn.run(
             ["ps", "-o", ",".join(f"{c}=" for c in columns), "-p", str(pid)],
             capture_output=True,
             text=True,
@@ -250,6 +251,18 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
 
     So the count is returned rather than swallowed, and ``list_sessions``
     below is the scan-shaped view that drops it.
+
+    ``iterdir``, NOT ``glob`` behind an ``is_dir`` check: both of those
+    suppress the ``OSError`` they hit, so a sessions directory that cannot be
+    listed -- or one whose stat fails because the profile root cannot be
+    traversed -- arrived at the GUARD as an empty directory rather than an
+    unknown one. Such a directory contributes exactly 1, which makes the count
+    a lower bound on the records at stake rather than a tally of them; every
+    caller only asks whether it is zero.
+
+    A MISSING directory is the one scan failure that still counts 0: a profile
+    that has never been run holds no records, and refusing on it would block
+    every guarded step against it permanently.
     """
     sessions_dir = (claude_dir or get_claude_dir()) / "sessions"
     try:

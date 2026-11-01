@@ -4790,6 +4790,145 @@ class TestDeadTokenQuarantine:
         assert not switcher._usage_store.entries({"1": identity})["1"].token_dead()
 
 
+class TestActiveQuarantineHealsFromLive:
+    """An ACTIVE slot struck on a stale backup must heal from the rotated live.
+
+    ``_entry_token_dead`` deliberately holds the strike while ANY stored
+    source (live OR backup) still carries the struck generation. Claude Code
+    rotating the live credential leaves the BACKUP on the struck generation,
+    and the only thing that resyncs it (``_resync_rotated_backup``) runs from
+    the fetch fast path — which a quarantined slot never reaches. The scan
+    must therefore attempt the resync itself, or the slot reads "re-login
+    needed" forever while Claude Code works fine on it.
+    """
+
+    _EMAIL = "test@example.com"
+    _STRUCK = json.dumps({"claudeAiOauth": {
+        "accessToken": "at-struck", "refreshToken": "rt-struck",
+        "expiresAt": 1000}})
+    _LIVE = json.dumps({"claudeAiOauth": {
+        "accessToken": "at-live", "refreshToken": "rt-live",
+        "expiresAt": 9999999999000}})
+    _LIVE_EXPIRED = json.dumps({"claudeAiOauth": {
+        "accessToken": "at-live", "refreshToken": "rt-live",
+        "expiresAt": 1000}})
+    _OWN_PROFILE = {"uuid": "uuid-1", "email": _EMAIL, "organizationUuid": ""}
+
+    def _setup(self, sample_sequence_data, live, *, struck_fp="struck"):
+        """Active slot 1: backup on the struck lineage, ``live`` rotated."""
+        sample_sequence_data["accounts"]["1"]["email"] = self._EMAIL
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        s._write_account_credentials("1", self._EMAIL, self._STRUCK)
+        s._write_credentials(live)
+        s._record_active_verdict(ActiveCredentials(live, False, False))
+        if struck_fp == "struck":
+            struck_fp = oauth.credential_fingerprint(self._STRUCK)
+        s._usage_store.record(
+            {"1": FetchRecord(error="invalid_grant", struck_fp=struck_fp)},
+            {"1": (self._EMAIL, "")},
+        )
+        info = [(1, self._EMAIL, "Org", "", True, live, "")]
+        return s, info
+
+    def _collect(self, s, info):
+        from claude_swap.oauth import UsageOutcome
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=UsageOutcome({"five_hour": {"utilization": 10}}),
+        ):
+            return s._collect_usage_entries(info)
+
+    def test_rotated_live_attributed_to_slot_heals_the_strike(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        s, info = self._setup(sample_sequence_data, self._LIVE)
+        with patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=self._OWN_PROFILE,
+        ) as probe:
+            entries = self._collect(s, info)
+
+        probe.assert_called()  # ownership was attributed, not assumed
+        assert entries["1"].sentinel != USAGE_RELOGIN_REQUIRED
+        backup, _ = s._read_account_credentials_ex("1", self._EMAIL)
+        assert backup == self._LIVE, "backup must follow the rotated live"
+        row = s._usage_store.entries({"1": (self._EMAIL, "")}, [])["1"]
+        assert row.auth_dead_strikes == 0 and row.struck_fingerprint is None
+
+    @pytest.mark.parametrize(
+        "profile",
+        [
+            {"uuid": "uuid-other", "email": "other@example.com",
+             "organizationUuid": "org-x"},
+            None,
+        ],
+        ids=["foreign-account", "probe-unreachable"],
+    )
+    def test_unattributed_live_leaves_the_strike_and_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data, profile
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        s, info = self._setup(sample_sequence_data, self._LIVE)
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=profile):
+            entries = self._collect(s, info)
+
+        assert entries["1"].sentinel == USAGE_RELOGIN_REQUIRED
+        backup, _ = s._read_account_credentials_ex("1", self._EMAIL)
+        assert backup == self._STRUCK, "a foreign/unverified live must not be written"
+        assert s._usage_store.entries(
+            {"1": (self._EMAIL, "")}, []
+        )["1"].auth_dead_strikes == 1
+
+    def test_expired_live_access_token_attempts_nothing(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        s, info = self._setup(sample_sequence_data, self._LIVE_EXPIRED)
+        with patch("claude_swap.oauth.fetch_oauth_profile") as probe, \
+             patch.object(
+                 s, "_resync_rotated_backup",
+                 wraps=s._resync_rotated_backup,
+             ) as resync:
+            entries = self._collect(s, info)
+
+        probe.assert_not_called()
+        resync.assert_not_called()
+        assert entries["1"].sentinel == USAGE_RELOGIN_REQUIRED
+
+    def test_degraded_active_read_attempts_nothing(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        s, info = self._setup(sample_sequence_data, self._LIVE)
+        # Keychain read failed and a fallback covered it: the bytes may be a
+        # consumed predecessor, so nothing may be written from them.
+        s._record_active_verdict(ActiveCredentials(self._LIVE, False, True))
+        with patch("claude_swap.oauth.fetch_oauth_profile") as probe, \
+             patch.object(s, "_resync_rotated_backup") as resync:
+            entries = self._collect(s, info)
+
+        probe.assert_not_called()
+        resync.assert_not_called()
+        assert entries["1"].sentinel == USAGE_RELOGIN_REQUIRED
+
+    def test_live_on_the_struck_generation_attempts_nothing(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        # Live IS the condemned generation: nothing newer to heal from.
+        s, info = self._setup(sample_sequence_data, self._STRUCK)
+        with patch("claude_swap.oauth.fetch_oauth_profile") as probe, \
+             patch.object(s, "_resync_rotated_backup") as resync:
+            entries = self._collect(s, info)
+
+        probe.assert_not_called()
+        resync.assert_not_called()
+        assert entries["1"].sentinel == USAGE_RELOGIN_REQUIRED
+
+
 class TestAddAccountOrgFields:
     def test_allows_same_email_different_org(self, temp_home):
         """Should allow adding same-email account if organizationUuid differs."""

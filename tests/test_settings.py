@@ -19,10 +19,12 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    RunSettings,
     UiSettings,
     CodexSettings,
     UpdateSettings,
     effective_settings,
+    load_run_settings,
     load_settings,
     load_ui_settings,
     load_update_settings,
@@ -42,6 +44,7 @@ from claude_swap.settings import (
 def _args(**kwargs) -> argparse.Namespace:
     defaults = {
         "threshold": None,
+        "weekly_threshold": None,
         "interval": None,
         "cooldown": None,
         "include_api_key_accounts": None,
@@ -219,6 +222,24 @@ class TestUiSettings:
             set_setting(tmp_path, "ui.theme", "purple")
 
 
+class TestRunSettings:
+    def test_missing_file_defaults_to_per_account_history(self, tmp_path: Path):
+        assert load_run_settings(tmp_path) == RunSettings(share_history=False)
+
+    def test_reads_share_history(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": True}}))
+        assert load_run_settings(tmp_path).share_history is True
+
+    def test_non_bool_falls_back_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"run": {"shareHistory": "yes"}}))
+        assert load_run_settings(tmp_path).share_history is False
+
+    def test_set_share_history(self, tmp_path: Path):
+        assert set_setting(tmp_path, "run.shareHistory", "true") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "run": {"shareHistory": True}}
+
+
 class TestUpdateSettings:
     def test_missing_file_checks(self, tmp_path: Path):
         assert load_update_settings(tmp_path) == UpdateSettings(check=True)
@@ -251,6 +272,9 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["run"] == {
+            f.name for f in RunSettings.__dataclass_fields__.values()
+        }
         assert by_section["updates"] == {
             f.name for f in UpdateSettings.__dataclass_fields__.values()
         }
@@ -261,6 +285,7 @@ class TestSettingSpecs:
             "ui": UiSettings(),
             "credentials": CredentialSettings(),
             "claude": ClaudeIntegrationSettings(),
+            "run": RunSettings(),
             "updates": UpdateSettings(),
             "codex": CodexSettings(),
         }
@@ -507,6 +532,24 @@ class TestPerGateThresholds:
         assert unset_setting(tmp_path, "autoswitch.threshold5h") is True
         assert load_settings(tmp_path).threshold_5h is None
 
+    def test_weekly_threshold_is_an_alias_under_the_specific_gates(self):
+        # 7d: threshold7d, then weeklyThreshold. Model M: modelThresholds[M],
+        # then weeklyThreshold. 5h never reads weeklyThreshold.
+        weekly_only = AutoSwitchSettings(weekly_threshold=97.0, model="Fable,Opus")
+        assert gate_thresholds(weekly_only).overrides == {
+            "7d": 97.0, "fable": 97.0, "opus": 97.0,
+        }
+        both = AutoSwitchSettings(
+            weekly_threshold=97.0, threshold_7d=95.0, threshold_5h=80.0,
+            model="Fable,Opus", model_thresholds="Fable=40",
+        )
+        gates = gate_thresholds(both)
+        assert gates.for_label("5h") == 80.0
+        assert gates.for_label("7d") == 95.0
+        assert gates.for_label("Fable") == 40.0
+        assert gates.for_label("Opus") == 97.0
+        assert gate_thresholds(AutoSwitchSettings(threshold_5h=80.0)).for_label("7d") == 90.0
+
     def test_with_model_threshold_keeps_the_others(self):
         assert with_model_threshold(None, "Fable", 40) == "Fable=40"
         assert with_model_threshold("Opus=60", "Fable", 40) == "Opus=60,Fable=40"
@@ -544,3 +587,78 @@ class TestPerGateThresholds:
         assert loaded.threshold_7d == 99.9
         assert loaded.model_thresholds == "Fable=40"
         assert parse_model_thresholds("Fable=40, Fable=10, Opus=oops") == (("Fable", 40.0),)
+class TestWeeklyThreshold:
+    """`weekly_threshold`: optional, same bounds as `threshold`, forgiving on
+    load and loud on `set` — the registry's first optional float."""
+
+    def test_defaults_to_none(self, tmp_path: Path):
+        assert AutoSwitchSettings().weekly_threshold is None
+        assert load_settings(tmp_path).weekly_threshold is None
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [("97", 97.0), ("970", 99.9), ("10", 50.0), ('"banana"', None), ("null", None)],
+    )
+    def test_load_clamps_numbers_and_drops_garbage(self, tmp_path: Path, raw, expected):
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"weeklyThreshold": %s}}' % raw
+        )
+        assert load_settings(tmp_path).weekly_threshold == expected
+
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+    def test_non_finite_numbers_fall_back_to_defaults(self, tmp_path: Path, literal):
+        # json.loads accepts these literals and min/max pass NaN through, so
+        # the clamp must treat non-finite as garbage for both lines — a NaN
+        # line would never be crossed.
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"threshold": %s, "weeklyThreshold": %s}}'
+            % (literal, literal)
+        )
+        loaded = load_settings(tmp_path)
+        assert loaded.threshold == AutoSwitchSettings().threshold
+        assert loaded.weekly_threshold is None
+
+    def test_an_integer_too_large_for_a_float_still_clamps(self, tmp_path: Path):
+        # Python ints are unbounded; isfinite() on one past float range raises
+        # OverflowError. The clamp must keep answering 99.9 for both lines.
+        huge = "1" + "0" * 400
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"threshold": %s, "weeklyThreshold": %s}}' % (huge, huge)
+        )
+        loaded = load_settings(tmp_path)
+        assert (loaded.threshold, loaded.weekly_threshold) == (99.9, 99.9)
+
+    def test_set_validates_loudly_and_unset_clears(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="between 50 and 99.9"):
+            set_setting(tmp_path, "autoswitch.weeklyThreshold", "970")
+        with pytest.raises(ConfigError, match="expects a number.*config unset"):
+            set_setting(tmp_path, "autoswitch.weeklyThreshold", "banana")
+        assert not settings_path(tmp_path).exists()
+        assert set_setting(tmp_path, "autoswitch.weeklyThreshold", "97") == 97.0
+        assert load_settings(tmp_path).weekly_threshold == 97.0
+        assert unset_setting(tmp_path, "autoswitch.weeklyThreshold") is True
+        assert load_settings(tmp_path).weekly_threshold is None
+
+    def test_a_weekly_line_below_the_5h_line_is_accepted(self, tmp_path: Path):
+        # "Keep a weekly reserve" is a legitimate policy; no cross-field rule.
+        set_setting(tmp_path, "autoswitch.threshold", "90")
+        assert set_setting(tmp_path, "autoswitch.weeklyThreshold", "80") == 80.0
+        loaded = load_settings(tmp_path)
+        assert (loaded.threshold, loaded.weekly_threshold) == (90.0, 80.0)
+
+    def test_cli_override_and_anchor(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(weekly_threshold=95.0), _args(weekly_threshold=97.0)
+        )
+        assert merged.weekly_threshold == 97.0
+        # --threshold alone leaves a configured weekly line in force (the
+        # #355 anchor bug class: both lines come from the one settings object).
+        merged = merged_with_cli(
+            AutoSwitchSettings(threshold=90.0, weekly_threshold=97.0),
+            _args(threshold=85.0),
+        )
+        assert (merged.threshold, merged.weekly_threshold) == (85.0, 97.0)
+
+    def test_cli_value_is_clamped(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(weekly_threshold=970.0))
+        assert merged.weekly_threshold == 99.9

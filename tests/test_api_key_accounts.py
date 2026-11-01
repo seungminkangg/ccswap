@@ -1151,3 +1151,43 @@ class TestADeniedKeychainSurvivesAnUnreadableFallbackFile:
         assert ac.keychain_unavailable is True, (
             "the keychain WAS denied; an unreadable fallback cannot clear that"
         )
+
+
+class TestMcpOnlyOAuthItemDoesNotReplaceTheKey:
+    """#24: with an API-key slot active, Claude Code can still write MCP login
+    state (``{"mcpOAuth": …}``) into its OAuth credential store. The active
+    read returns that store first, so switching away backed the MCP blob up
+    over the slot's key, and export shipped it in the key's place."""
+
+    MCP_ONLY = json.dumps({"mcpOAuth": {"linear": {"refreshToken": "mcp-rt"}}})
+
+    def _key_slot_active_with_mcp_blob(self) -> ClaudeAccountSwitcher:
+        s = _linux_switcher()
+        s.add_account_from_token(API_KEY, slot=1)
+        s.add_account_from_token(SETUP_TOKEN, slot=2)
+        s.switch_to("1", json_output=True)
+        cred_file = get_credentials_path()
+        cred_file.parent.mkdir(parents=True, exist_ok=True)
+        cred_file.write_text(self.MCP_ONLY, encoding="utf-8")
+        return s
+
+    def test_switch_away_keeps_the_key(self, temp_home: Path):
+        s = self._key_slot_active_with_mcp_blob()
+        email = s._get_sequence_data()["accounts"]["1"]["email"]
+
+        s.switch_to("2", json_output=True)
+
+        assert s._read_account_credentials("1", email) == API_KEY
+        # Activation still takes the live MCP state.
+        live = json.loads(get_credentials_path().read_text(encoding="utf-8"))
+        assert live["mcpOAuth"] == {"linear": {"refreshToken": "mcp-rt"}}
+
+    def test_export_ships_the_key(self, temp_home: Path, tmp_path: Path):
+        s = self._key_slot_active_with_mcp_blob()
+        out = tmp_path / "b.cswap"
+
+        export_accounts(s, str(out), "1")
+
+        payload = json.loads(out.read_text(encoding="utf-8"))
+        assert payload["accounts"][0]["credentials"] == API_KEY
+        assert payload["accounts"][0]["kind"] == "api_key"

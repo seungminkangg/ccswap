@@ -12,6 +12,7 @@ from claude_swap import __version__, paths, printer
 from claude_swap.codex import CodexAccountSwitcher
 from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 from claude_swap.json_output import error_envelope
+from claude_swap.models import Platform
 from claude_swap.printer import (
     accent,
     bolded,
@@ -21,7 +22,7 @@ from claude_swap.printer import (
     muted,
     warning,
 )
-from claude_swap.settings import load_ui_settings, load_update_settings
+from claude_swap.settings import load_run_settings, load_ui_settings, load_update_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -157,13 +158,14 @@ Examples:
     parser.add_argument(
         "--share-history",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Share conversation history (projects/ and history.jsonl) from "
             "~/.claude into the session profile, so every account sees one "
             "unified history. History the profile already accumulated is "
             "merged into ~/.claude first. --no-share-history restores "
-            "per-account history (the default). Not supported on Windows."
+            "per-account history (the default, unless `ccswap config set "
+            "run.shareHistory true`). Not supported on Windows."
         ),
     )
     parser.add_argument(
@@ -196,7 +198,7 @@ Examples:
                 args.account,
                 tail,
                 share=not args.no_share,
-                share_history=args.share_history,
+                share_history=_resolve_share_history(args, switcher),
                 require_session=args.require_session,
             )
             return  # only reachable in tests where exec/exit is mocked
@@ -209,7 +211,7 @@ Examples:
                 slot,
                 tail,
                 share=not args.no_share,
-                share_history=args.share_history,
+                share_history=_resolve_share_history(args, switcher),
                 require_session=args.require_session,
             )
             return  # only reachable in tests
@@ -244,6 +246,26 @@ def _refuse_session_in_file_backend(switcher: ClaudeAccountSwitcher) -> None:
             "ccswap run (session mode) needs the macOS Keychain and is not "
             "supported with credentials.backend file. Use `ccswap switch` instead."
         )
+
+
+def _resolve_share_history(args: argparse.Namespace, switcher) -> bool:
+    """The flag wins; otherwise run.shareHistory, which Windows can't honor.
+
+    An explicit --share-history still reaches SessionManager.run and errors
+    there; a setting-derived one just warns and falls back to per-account
+    history. Only called on account-targeting paths, so a bare unmapped run
+    (plain claude) stays silent.
+    """
+    if args.share_history is not None:
+        return args.share_history
+    enabled = load_run_settings(switcher.backup_dir).share_history
+    if enabled and switcher.platform == Platform.WINDOWS:
+        warning(
+            "run.shareHistory is not supported on Windows yet — "
+            "using per-account history."
+        )
+        return False
+    return enabled
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -848,6 +870,8 @@ def _gate_banner(settings) -> str:
         parts.append(f"5h {settings.threshold_5h:g}%")
     if settings.threshold_7d is not None:
         parts.append(f"7d {settings.threshold_7d:g}%")
+    if settings.weekly_threshold is not None:
+        parts.append(f"weekly {settings.weekly_threshold:g}%")
     for name, pct in parse_model_thresholds(settings.model_thresholds):
         parts.append(f"{name} {pct:g}%")
     if not parts:
@@ -884,12 +908,14 @@ Exit codes with --once:
   3  blocked: wanted to switch but no viable target / all exhausted
 
 Examples:
-  ccswap auto                       # foreground loop, switch at 90%% used
+  ccswap auto                       # foreground loop, switch at 90% used
   ccswap auto --threshold 80        # switch earlier
+  ccswap auto --weekly-threshold 97 # let the 7d/model windows run higher
   ccswap auto --model Fable         # also switch when the Fable weekly limit is hit
   ccswap auto --json                # one JSON event per line (for scripts)
   ccswap auto --once; echo $?       # single tick, outcome in exit code
   ccswap auto --dry-run             # log decisions, never actually switch
+  ccswap auto --install-service     # run at every login via launchd (macOS)
 
 Defaults live in settings.json in the backup root; flags override them.
         """,
@@ -917,6 +943,16 @@ Defaults live in settings.json in the backup root; flags override them.
         help=(
             "Switch when the active account's binding 5h/7d window reaches "
             "this utilization (50-99.9; default 90)"
+        ),
+    )
+    parser.add_argument(
+        "--weekly-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Gate for the 7d and per-model windows, below threshold7d/"
+            "modelThresholds (50-99.9; default: the threshold). A flag cannot "
+            "unset a configured value; use 'ccswap config unset'"
         ),
     )
     parser.add_argument(
@@ -987,7 +1023,35 @@ Defaults live in settings.json in the backup root; flags override them.
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--install-service",
+        action="store_true",
+        help=(
+            "Install a launchd LaunchAgent so auto-switching starts at login "
+            "and restarts on crash (macOS)"
+        ),
+    )
+    parser.add_argument(
+        "--uninstall-service",
+        action="store_true",
+        help="Stop the LaunchAgent and remove its plist (macOS)",
+    )
+    parser.add_argument(
+        "--service-status",
+        action="store_true",
+        help="Report whether the LaunchAgent is installed and running",
+    )
     args = parser.parse_args(argv)
+
+    service_action = args.install_service or args.uninstall_service or args.service_status
+    if service_action:
+        # The agent runs a bare `auto`, so anything else on this command line
+        # would be dropped without a word.
+        if len(argv) != 1:
+            parser.error(
+                "service flags take no other options; the service reads "
+                "settings.json, so use 'ccswap config set' for thresholds"
+            )
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.printer import accent, yellowed
@@ -1013,6 +1077,9 @@ Defaults live in settings.json in the backup root; flags override them.
             if os.geteuid() == 0 and not switcher._is_running_in_container():
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
+
+        if service_action:
+            sys.exit(_auto_service(args))
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
         engine = AutoSwitchEngine(
@@ -1091,6 +1158,7 @@ Examples:
   ccswap config                              # list effective settings
   ccswap config get autoswitch.threshold
   ccswap config set autoswitch.threshold 80
+  ccswap config set autoswitch.weeklyThreshold 97  # 7d/model gate (threshold7d wins)
   ccswap config unset autoswitch.threshold   # back to the default
   ccswap config set claude.statusline on     # ccswap statusline in Claude Code
   ccswap config set claude.mod on            # install the ccswap mod
@@ -1298,14 +1366,53 @@ def _menubar_service(args) -> int:
             print("Menu bar service was not installed.")
         return 0
 
-    result = launch_agent.status()
+    return _print_service_status(launch_agent.status(), "Menu bar", "menubar")
+
+
+def _auto_service(args) -> int:
+    """Handle ``auto --install-service|--uninstall-service|--service-status``."""
+    from claude_swap import launch_agent
+
+    label = launch_agent.AUTO_LABEL
+    if args.install_service:
+        result = launch_agent.install(label=label)
+        print(f"Auto-switch service installed ({result['label']}).")
+        print(f"  plist: {result['plist']}")
+        print(f"  logs:  {result['stdout_log']}")
+        print(
+            dimmed(
+                "It starts at login from now on. Re-run this after a ccswap "
+                "upgrade to point launchd at the new build."
+            )
+        )
+        if launch_agent.is_loaded():
+            # The menu bar's Auto-switch toggle runs an engine of its own.
+            warning(
+                "The menu bar service is also installed. If its Auto-switch "
+                "toggle is on, turn it off so only one engine is polling.",
+                file=sys.stderr,
+            )
+        return 0
+
+    if args.uninstall_service:
+        result = launch_agent.uninstall(label=label)
+        if result["was_loaded"] or result["removed_plist"]:
+            print("Auto-switch service removed.")
+        else:
+            print("Auto-switch service was not installed.")
+        return 0
+
+    return _print_service_status(launch_agent.status(label=label), "Auto-switch", "auto")
+
+
+def _print_service_status(result: dict, name: str, subcommand: str) -> int:
     if not result["installed"] and not result["loaded"]:
-        print("Menu bar service is not installed.")
-        print(dimmed("Install it with: ccswap menubar --install-service"))
+        print(f"{name} service is not installed.")
+        print(dimmed(f"Install it with: ccswap {subcommand} --install-service"))
         return 0
     state = result["state"] or ("loaded" if result["loaded"] else "stopped")
     pid = f" (pid {result['pid']})" if result["pid"] else ""
-    print(f"Menu bar service: {state}{pid}")
+    print(f"{name} service: {state}{pid}")
     print(f"  plist: {result['plist']}")
     if not result["installed"]:
         print(dimmed("launchd still has it loaded, but the plist is gone."))
@@ -1414,6 +1521,7 @@ Commands:
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
+  %(prog)s auto --install-service     keep auto-switch running via launchd
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all ccswap data
 

@@ -2,7 +2,7 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch``, ``ui``, ``updates`` and ``credentials`` sections, plus
+``autoswitch``, ``ui``, ``run``, ``updates`` and ``credentials`` sections, plus
 ``claude`` (the statusline saved by ``claude_integration``); other
 sections can be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from pathlib import Path
 
 from claude_swap.exceptions import ConfigError
 from claude_swap.fsutil import atomic_write_text, publish_target
+from claude_swap.i18n import LANGUAGES
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -48,6 +50,10 @@ class AutoSwitchSettings:
     """
 
     threshold: float = 90.0
+    # Upstream's switch line for the 7-day window and every per-model window.
+    # Here an alias below the specific gates: threshold_7d / model_thresholds
+    # win where set. None = ``threshold`` (see ``gate_thresholds``).
+    weekly_threshold: float | None = None
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
@@ -75,6 +81,8 @@ class AutoSwitchSettings:
     # absent from ``model``; a model listed in ``model`` without an entry
     # here still uses ``threshold``.
     model_thresholds: str | None = None
+    # Real, quota-consuming Haiku requests; deliberately opt-in.
+    warmup_five_hour: bool = False
 
 
 @dataclass(frozen=True)
@@ -88,6 +96,7 @@ class UiSettings:
     view: str = "combined"
     mask: bool = False
     star_prompt: bool = True
+    language: str = "en"
 
 
 @dataclass(frozen=True)
@@ -106,6 +115,13 @@ class ClaudeIntegrationSettings:
 
     statusline: bool = False
     mod: bool = False
+
+
+@dataclass(frozen=True)
+class RunSettings:
+    """Defaults for ``cswap run`` (``run`` section); its flags override them."""
+
+    share_history: bool = False
 
 
 @dataclass(frozen=True)
@@ -133,6 +149,7 @@ _SECTION_DEFAULT_SOURCES = {
     "ui": UiSettings,
     "credentials": CredentialSettings,
     "claude": ClaudeIntegrationSettings,
+    "run": RunSettings,
     "updates": UpdateSettings,
     "codex": CodexSettings,
 }
@@ -175,8 +192,16 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Switch when the binding 5h/7d window reaches this pct",
         ),
         SettingSpec(
+            "autoswitch", "weeklyThreshold", "weekly_threshold", "optional_float", 50.0, 99.9,
+            help="7d and per-model gate below threshold7d/modelThresholds; unset uses threshold",
+        ),
+        SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
             help="Poll interval for the ccswap auto loop, in seconds",
+        ),
+        SettingSpec(
+            "autoswitch", "warmupFiveHour", "warmup_five_hour", "bool",
+            help="Start idle Claude 5h windows with a minimal Haiku request (uses quota)",
         ),
         SettingSpec(
             "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,
@@ -221,6 +246,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Per-model gates, e.g. Fable=40 or Fable=40,Opus=70 (each 1-99.9)",
         ),
         SettingSpec(
+            "ui", "language", "language", "choice", choices=tuple(LANGUAGES),
+            help="TUI language; restart the dashboard after changing it",
+        ),
+        SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
         ),
@@ -252,6 +281,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "claude", "mod", "mod", "bool",
             help="ccswap mod (Claude Code plugin ccswap@ccswap)",
+        ),
+        SettingSpec(
+            "run", "shareHistory", "share_history", "bool",
+            help="ccswap run shares chat history unless --no-share-history",
         ),
         SettingSpec(
             "updates", "check", "check", "bool",
@@ -463,9 +496,19 @@ class GateThresholds:
 
 
 def gate_thresholds(settings: AutoSwitchSettings) -> GateThresholds:
-    """Effective per-gate thresholds for one settings snapshot."""
+    """Effective per-gate thresholds for one settings snapshot.
+
+    Each window takes the first one set: 5h ``threshold_5h``; 7d
+    ``threshold_7d``, ``weekly_threshold``; a model window
+    ``model_thresholds[M]``, ``weekly_threshold``; then ``threshold``.
+    """
     default = float(settings.threshold)
+    weekly = settings.weekly_threshold
     overrides: dict[str, float] = {}
+    if weekly is not None:
+        # Upstream's weeklyThreshold, as an alias under the specific keys.
+        for label in ("7d", *parse_model_names(settings.model)):
+            overrides[label.lower()] = float(weekly)
     if settings.threshold_5h is not None:
         overrides["5h"] = float(settings.threshold_5h)
     if settings.threshold_7d is not None:
@@ -479,8 +522,17 @@ def gate_thresholds(settings: AutoSwitchSettings) -> GateThresholds:
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
     """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
 
-    def num(value, default: float, lo: float, hi: float) -> float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+    def num(value, default: float | None, lo: float, hi: float) -> float | None:
+        # json.loads accepts NaN/Infinity literals and min/max pass NaN
+        # through unclamped, so a non-finite float is garbage too (a NaN line
+        # would silently never be crossed). Floats only: an int is always
+        # finite, and isfinite() would overflow on one too large for a float
+        # — the clamp below handles that without ever converting it.
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or (isinstance(value, float) and not math.isfinite(value))
+        ):
             return default
         return float(min(max(value, lo), hi))
 
@@ -493,7 +545,9 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             clamped = num(value, spec.default, spec.lo, spec.hi)
             kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
         elif spec.kind == "bool":
-            kwargs[spec.field] = bool(value)
+            kwargs[spec.field] = (
+                value is True if spec.field == "warmup_five_hour" else bool(value)
+            )
         elif spec.kind == "string":
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.
@@ -501,10 +555,14 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
         elif spec.kind == "optional_float":
             # None inherits autoswitch.threshold. A bad type does too, rather
             # than crashing; an out-of-range number clamps like the other pcts.
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or (isinstance(value, float) and not math.isfinite(value))
+            ):
                 kwargs[spec.field] = None
             else:
-                kwargs[spec.field] = float(min(max(float(value), spec.lo), spec.hi))
+                kwargs[spec.field] = float(min(max(value, spec.lo), spec.hi))
         elif spec.kind == "model_thresholds":
             pairs = parse_model_thresholds(value if isinstance(value, str) else None)
             kwargs[spec.field] = format_model_thresholds(pairs) if pairs else None
@@ -557,6 +615,10 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
     default = UiSettings()
     if not isinstance(section, dict):
         return default
+    language = section.get("language", default.language)
+    if language not in SETTING_SPECS["ui.language"].choices:
+        _logger.warning("settings.json: unsupported ui.language %r; using %r", language, default.language)
+        language = default.language
     theme = section.get("theme", default.theme)
     if theme not in SETTING_SPECS["ui.theme"].choices:
         _logger.warning(
@@ -585,7 +647,7 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
             star_prompt, default.star_prompt,
         )
         star_prompt = default.star_prompt
-    return UiSettings(theme=theme, view=view, mask=mask, star_prompt=star_prompt)
+    return UiSettings(theme=theme, view=view, mask=mask, star_prompt=star_prompt, language=language)
 
 
 def load_credential_settings(backup_root: Path) -> CredentialSettings:
@@ -644,6 +706,15 @@ def load_codex_settings(backup_root: Path) -> CodexSettings:
             value = getattr(default, attr)
         values[attr] = value
     return CodexSettings(**values)
+
+
+def load_run_settings(backup_root: Path) -> RunSettings:
+    """Load the run section; missing/corrupt file or non-bool value → default."""
+    section = _read_raw(settings_path(backup_root)).get("run")
+    value = section.get("shareHistory") if isinstance(section, dict) else None
+    if not isinstance(value, bool):
+        return RunSettings()
+    return RunSettings(share_history=value)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -714,8 +785,15 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
         value = int(raw_value) if kind == "int" else float(raw_value)
     except ValueError:
         noun = "an integer" if kind == "int" else "a number"
+        # An optional number has no spelling for "unset" here; point at the
+        # command that clears it instead of leaving "none" as a dead end.
+        hint = (
+            f"; use 'ccswap config unset {spec.dotted}' to clear it"
+            if spec.default is None
+            else ""
+        )
         raise ConfigError(
-            f"{spec.dotted} expects {noun}, got '{raw_value}'"
+            f"{spec.dotted} expects {noun}, got '{raw_value}'{hint}"
         ) from None
     if not spec.lo <= value <= spec.hi:
         raise ConfigError(
@@ -825,6 +903,7 @@ def effective_settings(
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
         "credentials": load_credential_settings(backup_root),
+        "run": load_run_settings(backup_root),
         "updates": load_update_settings(backup_root),
         "codex": load_codex_settings(backup_root),
     }
@@ -847,6 +926,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     overrides = {}
     for attr, field in (
         ("threshold", "threshold"),
+        ("weekly_threshold", "weekly_threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),

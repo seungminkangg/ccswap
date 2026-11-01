@@ -1,9 +1,9 @@
-"""Run ``cswap menubar`` as a launchd LaunchAgent instead of a foreground process.
+"""Run ``cswap menubar`` or ``cswap auto`` as a launchd LaunchAgent.
 
-``cswap menubar`` blocks the terminal that started it, so the status item dies
-with that terminal — and never comes back after a logout or reboot. launchd is
-the native macOS answer: a per-user LaunchAgent starts the menu bar at login and
-restarts it if it crashes. (The wrapper ``.app`` the menu bar runs inside is
+Both block the terminal that started them, so they die with that terminal — and
+never come back after a logout or reboot. launchd is the native macOS answer: a
+per-user LaunchAgent starts the command at login and restarts it if it crashes.
+(The wrapper ``.app`` the menu bar runs inside is
 ``claude_swap.app_bundle``'s business: ``cswap menubar`` builds it and execs
 into it itself, so launchd only ever needs the console script.)
 
@@ -34,17 +34,44 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.fsutil import atomic_write_bytes
 
 LABEL = "com.ccswap.menubar"
+AUTO_LABEL = "com.ccswap.auto"
+
+# Label -> (subcommand, launchd ProcessType). A menu bar owner is a UI process;
+# Background would have launchd apply throttled I/O and CPU bands to it. The
+# auto-switch loop sleeps between polls and has nobody waiting on it, so
+# Background is what it wants.
+_SERVICES = {
+    LABEL: ("menubar", "Interactive"),
+    AUTO_LABEL: ("auto", "Background"),
+}
 
 # launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin, which covers
 # `security` (Keychain reads) but not a Homebrew or ~/.local/bin `claude`. The
 # menu bar shells out to detect running sessions, so seed a PATH that finds it.
 _EXTRA_PATH_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 _BASE_PATH_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+# launchd does not inherit the installing shell's environment, so a user behind
+# a proxy would get an agent that dials direct. Forward only these, never all.
+# A key that is set but empty is forwarded too: urllib reads an empty lowercase
+# name as cancelling its uppercase twin (`https_proxy=` switches off an
+# `HTTPS_PROXY`), so dropping it would hand the agent a proxy the shell had
+# turned off. launchd sets an empty string as an empty variable.
+_FORWARDED_ENV_KEYS = (
+    "https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY",
+    "no_proxy", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
+)
+
+# `auto` must manage the same profile the installing shell does, or a custom
+# config dir gets an agent that silently polls and switches ~/.claude instead.
+_AUTO_FORWARDED_ENV_KEYS = ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR")
 
 # `launchctl bootout` can return before launchd has finished tearing the
 # job down, and a `bootstrap` inside that window fails with "Operation
@@ -57,7 +84,7 @@ _UNLOAD_POLL_SECONDS = 0.1
 def _require_macos() -> None:
     if sys.platform != "darwin":
         raise ClaudeSwitchError(
-            "The menu bar service is only available on macOS."
+            "The launchd service is only available on macOS."
         )
 
 
@@ -121,10 +148,27 @@ def _path_env(program: list[str]) -> str:
     return ":".join(dirs)
 
 
+def _forwarded_env(label: str, env: Mapping[str, str]) -> dict[str, str]:
+    """Allowlisted variables of ``env`` for the agent."""
+    forwarded = {k: env[k] for k in _FORWARDED_ENV_KEYS if k in env}
+    if label == AUTO_LABEL:
+        # Inside `ccswap run` the config dir is a throwaway profile under
+        # <backup>/sessions/, which a login service must not pin itself to.
+        forwarded.update(
+            {
+                k: env[k]
+                for k in _AUTO_FORWARDED_ENV_KEYS
+                if k in env and Path(env[k]).parent.name != "sessions"
+            }
+        )
+    return forwarded
+
+
 def build_plist(
     program: list[str] | None = None,
     label: str = LABEL,
     home: Path | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> bytes:
     """Serialize the LaunchAgent plist.
 
@@ -132,21 +176,23 @@ def build_plist(
     containing ``&`` or ``<`` cannot produce a plist launchd refuses to parse.
     """
     program = program or resolve_program()
+    subcommand, process_type = _SERVICES[label]
     out_log, err_log = log_paths(label, home)
+    env = os.environ if env is None else env
+    forwarded = _forwarded_env(label, env)
     return plistlib.dumps(
         {
             "Label": label,
-            "ProgramArguments": [*program, "menubar"],
+            "ProgramArguments": [*program, subcommand],
             "RunAtLoad": True,
             # Restart a crash, but respect a deliberate Quit. The menu bar's
             # quit handler calls rumps.quit_application(), a clean exit(0);
             # under a bare `KeepAlive: True` launchd would relaunch it at once
-            # and the Quit item would do nothing the user can see.
+            # and the Quit item would do nothing the user can see. `auto` also
+            # exits 0 on SIGTERM.
             "KeepAlive": {"SuccessfulExit": False},
-            # A menu bar owner is a UI process; Background would have launchd
-            # apply throttled I/O and CPU bands to it.
-            "ProcessType": "Interactive",
-            "EnvironmentVariables": {"PATH": _path_env(program)},
+            "ProcessType": process_type,
+            "EnvironmentVariables": {"PATH": _path_env(program), **forwarded},
             "StandardOutPath": str(out_log),
             "StandardErrorPath": str(err_log),
         }
@@ -235,7 +281,10 @@ def install(
 
     target_plist.parent.mkdir(parents=True, exist_ok=True)
     out_log.parent.mkdir(parents=True, exist_ok=True)
-    target_plist.write_bytes(build_plist(program, label, home))
+    # Owner-only and atomic, not the umask's 0644 via write_bytes: a forwarded
+    # proxy URL can carry credentials, and a write cut short by Ctrl-C must
+    # not leave a truncated plist for the next login to choke on.
+    atomic_write_bytes(target_plist, build_plist(program, label, home))
 
     settled = True
     if is_loaded(label, uid):
@@ -255,7 +304,7 @@ def install(
     return {
         "label": label,
         "plist": str(target_plist),
-        "program": [*program, "menubar"],
+        "program": [*program, _SERVICES[label][0]],
         "stdout_log": str(out_log),
         "stderr_log": str(err_log),
     }
