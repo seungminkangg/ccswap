@@ -426,3 +426,55 @@ def test_all_exhausted_reports_the_earliest_weekly_reset(tmp_path):
 
     assert events[-1].kind == "all-exhausted"
     assert events[-1].earliest_reset_at == "1970-01-01T00:50:00Z"
+
+
+def test_at_limit_does_not_bounce_to_an_account_above_the_threshold(tmp_path):
+    switcher = FakeCodexSwitcher(
+        tmp_path, (_account("1", 100, active=True), _account("2", 98))
+    )
+    events = []
+    engine = CodexAutoSwitchEngine(
+        switcher, AutoSwitchSettings(threshold=90), events.append, clock=lambda: 1000
+    )
+
+    assert engine.tick() is TickOutcome.BLOCKED
+    assert switcher.switched_to == []
+    assert events[-1].reason == "no-qualifying-candidate"
+
+
+def _seed_auto_landing(tmp_path, number):
+    (tmp_path / "codex_autoswitch_state.json").write_text(
+        json.dumps({"schemaVersion": 1, "lastSwitchAt": 0, "lastSwitchTo": number})
+    )
+
+
+def test_a_hand_switch_onto_an_exhausted_account_is_not_undone(tmp_path):
+    _seed_auto_landing(tmp_path, "2")
+    switcher = FakeCodexSwitcher(
+        tmp_path, (_account("1", 100, active=True), _account("2", 20))
+    )
+    events = []
+    engine = CodexAutoSwitchEngine(
+        switcher, AutoSwitchSettings(threshold=90), events.append, clock=lambda: 1000
+    )
+
+    assert engine.tick() is TickOutcome.NO_ACTION
+    assert switcher.switched_to == []
+    assert events[-1].reason == "manual-switch"
+
+
+def test_a_hand_switch_is_adopted_once_its_account_is_usable(tmp_path):
+    _seed_auto_landing(tmp_path, "2")
+    accounts = (_account("1", 50, active=True), _account("2", 20))
+    switcher = FakeCodexSwitcher(tmp_path, accounts)
+    events = []
+    engine = CodexAutoSwitchEngine(
+        switcher, AutoSwitchSettings(threshold=90), events.append, clock=lambda: 1000
+    )
+    assert engine.tick() is TickOutcome.NO_ACTION
+    assert events[-1].reason == "below-threshold"
+
+    switcher.accounts = (replace(accounts[0], usage=UsageEntry(
+        last_good={"five_hour": {"pct": 95}})), accounts[1])
+    assert engine.tick() is TickOutcome.SWITCHED
+    assert switcher.switched_to == ["2"]

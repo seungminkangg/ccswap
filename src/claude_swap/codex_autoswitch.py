@@ -189,6 +189,23 @@ class CodexAutoSwitchEngine:
         resets = {number: _weekly_reset(value, now) for number, value in usage.items()}
         active_reset = resets[current]
 
+        # The active account differs from where the engine last landed: the user
+        # switched by hand. Keep that choice while the account is spent; adopt it
+        # as the engine's own once it is usable so a later limit still moves on.
+        landed_on = self._read_state().get("lastSwitchTo")
+        if landed_on is not None and str(landed_on) != str(current):
+            if not below_threshold:
+                self._emit(NoSwitchEvent(
+                    reason="manual-switch",
+                    detail=f"keeping account {current}, chosen by hand",
+                ))
+                return TickOutcome.NO_ACTION
+            if not self.dry_run:
+                with self._state_lock():
+                    state = self._read_state()
+                    state["lastSwitchTo"] = current
+                    atomic_write_json(self.state_path, state)
+
         if below_threshold:
             if self.settings.strategy != "consume-first" or active_reset is None:
                 return self._below_threshold(usage[current], active_headroom, overrides)
@@ -224,6 +241,10 @@ class CodexAutoSwitchEngine:
             if candidate_headroom is None or candidate_headroom <= 0:
                 continue
             candidate_pct = policy[account.number]
+            # A restart onto an account that is itself past the gate buys
+            # almost nothing and costs the desktop its running turns.
+            if trigger == "at-limit" and candidate_pct >= self.settings.threshold:
+                continue
             if trigger == "proactive" and (
                 candidate_pct > hysteresis_bar
                 or candidate_pct >= active_pct
