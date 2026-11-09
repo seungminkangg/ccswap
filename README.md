@@ -9,7 +9,7 @@
 
 > **Fork note.** This is a fork of [errhythm/ccswap](https://github.com/errhythm/ccswap) that adds a Codex desktop restart around Codex switches (`codex.restartDesktop`, macOS), an opt-in continuation of threads the usage limit stopped (`codex.resumeAfterRestart`), and setup-token usage via Claude Code's `/usage`. Install it with `uv tool install --managed-python --with rumps git+https://github.com/seungminkangg/ccswap@main` (a managed Python so the menu bar icon draws); `ccswap upgrade` then follows this fork.
 
-Multi-account and usage manager for Claude Code and OpenAI Codex. Save multiple logins, check their quota windows, switch manually or automatically before you hit a rate limit, and manage both providers from one dashboard.
+Multi-account and usage manager for Claude Code, OpenAI Codex and Antigravity. Save multiple logins, check their quota windows, and manage them from one dashboard. Claude Code and Codex also support automatic switching.
 
 <img src="https://raw.githubusercontent.com/errhythm/ccswap/main/assets/tui-watch.png" width="760" alt="ccswap watch: live usage bars for every Claude Code and Codex account, with reset times and the active account marked">
 
@@ -40,6 +40,8 @@ ccswap auto       # or let it switch for you before a limit is hit
 
 Codex accounts work the same way: run `codex login`, then `ccswap codex add`.
 
+For personal Google Antigravity accounts, sign in with `agy`, then run `ccswap agy add`. Use `ccswap agy usage` for every quota group and `ccswap agy switch 2` to change the shared login. Existing CLI, App and IDE sessions may need a restart. [Antigravity accounts](docs/antigravity.md)
+
 You usually don't need to restart Claude Code after a switch. Codex always needs one. See [restarts](https://github.com/errhythm/ccswap/blob/main/docs/how-it-works.md#restarts-and-session-behavior).
 
 ## Common tasks
@@ -68,6 +70,7 @@ Optional [five-hour window warming](docs/auto-switching.md#optional-five-hour-wi
 - [Automatic switching](https://github.com/errhythm/ccswap/blob/main/docs/auto-switching.md)
 - [Session mode](https://github.com/errhythm/ccswap/blob/main/docs/session-mode.md)
 - [Codex accounts](https://github.com/errhythm/ccswap/blob/main/docs/codex.md)
+- [Antigravity accounts](docs/antigravity.md)
 - [Dashboard and menu bar](https://github.com/errhythm/ccswap/blob/main/docs/dashboard.md)
 - [Statusline and mod](https://github.com/errhythm/ccswap/blob/main/docs/statusline-and-mod.md)
 - [Configuration, backup and sharing](https://github.com/errhythm/ccswap/blob/main/docs/configuration.md)
