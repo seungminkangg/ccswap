@@ -640,6 +640,7 @@ def run(switcher) -> int:
             self._refreshing = False
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
+            self._seq_mtime = 0.0
             self._last_usage_log: dict = {}  # (provider, account num) -> last-logged (5h, 7d) key
             # Auto-switch engine (the same one `cswap auto` runs), hosted in a
             # background thread while enabled.
@@ -793,6 +794,17 @@ def run(switcher) -> int:
             # this file often for unrelated reasons).
             if self._refreshing:
                 return  # a worker is already in-flight; it refreshes the marker
+            # sequence.json holds the disabled flags and aliases: a CLI
+            # enable/disable/alias shows within ~1s instead of on the next
+            # refresh tick. It is written only on such events, never per refresh.
+            try:
+                seq_mtime = self.switcher.sequence_file.stat().st_mtime
+            except OSError:
+                seq_mtime = 0.0
+            if seq_mtime != self._seq_mtime:
+                self._seq_mtime = seq_mtime
+                self.refresh_async()
+                return
             try:
                 mtime = self._config_path.stat().st_mtime
             except OSError:
