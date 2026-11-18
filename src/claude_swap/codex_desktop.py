@@ -34,6 +34,7 @@ import logging
 import os
 import plistlib
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -235,6 +236,53 @@ def _alive(pairs: list[tuple[int, float]]) -> list[int]:
     except (OSError, subprocess.SubprocessError):
         return [pid for pid, _ in pairs]  # Unknown is alive: never assume an exit.
     return [pid for pid, started in pairs if (pid, started) in current]
+
+
+def _terminate(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+def stop_idle_daemon(home: Path, pids: list[int]) -> bool:
+    """Stop Codex's managed app-server daemon when it alone blocks a handoff.
+
+    The daemon (``$CODEX_HOME/packages/app-server-daemon``) runs detached from
+    the desktop and outlives it, so every switch used to wait on it forever.
+    Only when every outside writer is that daemon and no turn started since it
+    did is still running, it is asked to stop with its own
+    ``app-server daemon stop``; the pid-update-loop that command leaves behind
+    then gets a SIGTERM. Codex starts the daemon again on next use, on the
+    new login. Anything else (a CLI run) keeps the handoff waiting.
+    """
+    root = (home / "packages" / "app-server-daemon").resolve()
+    try:
+        procs = [p for p in _ps() if p.pid in pids]
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if not procs or len(procs) != len(pids):
+        return False
+    if not all(Path(p.exe).resolve().is_relative_to(root) for p in procs):
+        return False
+    if desktop_activity(home, min(p.started for p in procs))[0] != "idle":
+        return False
+    try:
+        spawn.run([procs[0].exe, "app-server", "daemon", "stop"],
+                  capture_output=True, text=True, timeout=QUIT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    pairs = [(p.pid, p.started) for p in procs]
+    for pid in _alive(pairs):
+        _terminate(pid)
+    deadline = time.monotonic() + QUIT_TIMEOUT_S
+    while _alive(pairs):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(_POLL_S)
+    _logger.info("Stopped Codex's idle app-server daemon (PID %s) for an account switch",
+                 ", ".join(map(str, pids)))
+    return True
 
 
 # ---- activity --------------------------------------------------------------
@@ -552,6 +600,9 @@ def switch_with_desktop(
             result = switcher._switch_auth(identifier, json_output=json_output)
             result["desktop"] = {"state": "not-running", "message": _codex_restart_hint()}
             return result
+        if (len(scan.apps) == 1 and scan.others
+                and stop_idle_daemon(switcher.codex_home, scan.others)):
+            scan = scan_desktop(switcher.codex_home)
         if len(scan.apps) == 1 and scan.others:
             # A CLI run (or a thread we resumed) is transient: wait, not an error.
             return _stay(switcher, "desktop-busy",

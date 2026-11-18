@@ -273,6 +273,56 @@ def test_codex_cli_sharing_the_home_waits_instead_of_failing(accounts, mac):
     assert "osascript" not in mac.commands() and _live(home) == before
 
 
+def _spawn_daemon(mac, home) -> tuple[int, int]:
+    """Codex's managed app-server daemon: a pid-update-loop and its server."""
+    exe = str(home / "packages/app-server-daemon/releases/0.169.1/bin/codex")
+    loop = mac._spawn(1, exe, NOW - 7200)
+    server = mac._spawn(loop, exe, NOW - 7200)
+
+    def run(argv, **kw):
+        if argv[1:] == ["app-server", "daemon", "stop"]:
+            mac.calls.append(list(argv))
+            mac.procs = [p for p in mac.procs if p.pid != server]  # The loop stays.
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return FakeMac.run(mac, argv, **kw)
+
+    mac.run_override = run
+    return loop, server
+
+
+def test_idle_managed_daemon_is_stopped_and_the_switch_goes_through(accounts, mac, monkeypatch):
+    switcher, home = accounts
+    mac.start_app()
+    loop, _server = _spawn_daemon(mac, home)
+    terminated = []
+
+    def terminate(pid):
+        terminated.append(pid)
+        mac.procs = [p for p in mac.procs if p.pid != pid]
+
+    monkeypatch.setattr(codex_desktop, "_terminate", terminate)
+
+    result = switcher.switch_to("1", json_output=True)
+
+    assert result["switched"] and result["desktop"]["state"] == "restarted"
+    assert mac.calls[0][1:] == ["app-server", "daemon", "stop"] and terminated == [loop]
+    assert _live(home) == _auth("one@example.com", "acct-1")
+
+
+def test_managed_daemon_beside_a_cli_run_still_waits(accounts, mac, monkeypatch):
+    switcher, home = accounts
+    mac.start_app()
+    _spawn_daemon(mac, home)
+    mac.spawn_cli(None)
+    monkeypatch.setattr(codex_desktop, "_terminate", lambda pid: pytest.fail("signalled"))
+    before = _live(home)
+
+    result = switcher.switch_to("1", json_output=True)
+
+    assert result["reason"] == "desktop-busy" and "shares this CODEX_HOME" in result["message"]
+    assert mac.calls == [] and _live(home) == before
+
+
 def test_codex_cli_in_another_home_does_not_block(accounts, mac):
     switcher, _home = accounts
     mac.start_app()
