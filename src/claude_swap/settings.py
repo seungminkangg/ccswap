@@ -81,6 +81,11 @@ class AutoSwitchSettings:
     # absent from ``model``; a model listed in ``model`` without an entry
     # here still uses ``threshold``.
     model_thresholds: str | None = None
+    # Slot number or email of an account with extra-usage credits enabled. When
+    # every other account is over its gates the engine parks there and spends
+    # credits instead of running the active account into its hard limit; it
+    # leaves once a peer is back under the threshold by hysteresisPct.
+    credit_fallback: str | None = None
     # Real, quota-consuming Haiku requests; deliberately opt-in.
     warmup_five_hour: bool = False
 
@@ -244,6 +249,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "modelThresholds", "model_thresholds", "model_thresholds",
             help="Per-model gates, e.g. Fable=40 or Fable=40,Opus=70 (each 1-99.9)",
+        ),
+        SettingSpec(
+            "autoswitch", "creditFallback", "credit_fallback", "string",
+            help="Account (num|email) whose extra-usage credits take over when all are spent",
         ),
         SettingSpec(
             "ui", "language", "language", "choice", choices=tuple(LANGUAGES),

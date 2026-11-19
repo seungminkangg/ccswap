@@ -1984,6 +1984,79 @@ class TestApiKeyAccounts:
         ]
 
 
+def _credits(usage: dict, pct: float = 0.0) -> dict:
+    return {**usage, "spend": {"used": 0.0, "limit": 300.0, "pct": pct, "currency": "USD"}}
+
+
+class TestCreditFallback:
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, credit_fallback="1")
+        h.seed(1, "credits@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        return h
+
+    def test_all_spent_moves_to_credit_account(self, temp_home):
+        h = self._harness(temp_home)
+        h.make_live("b@example.com", 2)
+        outcome = h.tick_with_usage({
+            "1": _credits(_usage(100)), "2": _usage(97), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_parked_on_credits_ignores_a_peer_with_a_sliver(self, temp_home):
+        h = self._harness(temp_home)
+        h.make_live("credits@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _credits(_usage(100)), "2": _usage(97), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)][-1] == (
+            "on-credit-fallback"
+        )
+
+    def test_leaves_credits_once_a_peer_recovers(self, temp_home):
+        h = self._harness(temp_home)
+        h.make_live("credits@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _credits(_usage(100)), "2": _usage(5), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_spent_credits_are_not_a_target(self, temp_home):
+        h = self._harness(temp_home)
+        h.make_live("b@example.com", 2)
+        outcome = h.tick_with_usage({
+            "1": _credits(_usage(100), pct=100.0), "2": _usage(97), "3": _usage(100),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+
+    def test_no_spend_row_means_no_credits(self, temp_home):
+        h = self._harness(temp_home)
+        h.make_live("b@example.com", 2)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(97), "3": _usage(100),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+
+
+def test_spend_parsed_when_utilization_is_null():
+    result = oauth.build_usage_result({
+        "five_hour": {"utilization": 10.0},
+        "extra_usage": {
+            "is_enabled": True, "monthly_limit": 30000, "used_credits": 0.0,
+            "utilization": None, "currency": "USD",
+        },
+    })
+    assert result["spend"]["pct"] == 0.0
+    assert result["spend"]["limit"] == 300.0
+
+
 class TestFreshening:
     def test_near_expiry_target_is_refreshed_and_persisted(self, temp_home):
         h = EngineHarness(temp_home)

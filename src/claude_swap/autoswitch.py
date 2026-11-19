@@ -1415,6 +1415,24 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
+        credit = self._credit_fallback(usage, settings) if trigger != "consume-first" else None
+        if credit is not None and current == credit:
+            # Parked on credits: the at-limit escape would take any peer with a
+            # sliver of headroom and bounce straight back. Leave only for an
+            # account that is under the threshold by the hysteresis margin.
+            floor = 100.0 - settings.threshold + settings.hysteresis_pct
+            ordered = [n for n in ordered if (policy.get(n) or 0.0) > floor]
+            if not ordered:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="on-credit-fallback",
+                        detail="spending extra-usage credits until an account frees up",
+                    )
+                )
+                return TickOutcome.NO_ACTION
+        elif credit is not None and not ordered and credit in candidates:
+            ordered = [credit]
+
         if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
@@ -1581,6 +1599,28 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    def _credit_fallback(
+        self, usage: dict, settings: AutoSwitchSettings
+    ) -> str | None:
+        """The configured extra-usage account, while its credits still have room.
+
+        Needs a measured ``spend`` row: an account without one has credits off
+        (or an unlimited budget the API does not report), and parking there
+        would just run into the same hard limit.
+        """
+        if not settings.credit_fallback:
+            return None
+        try:
+            num = self.switcher.resolve_account(settings.credit_fallback)[0]
+        except ClaudeSwitchError:
+            return None
+        row = usage.get(num)
+        spend = row.get("spend") if isinstance(row, dict) else None
+        pct = spend.get("pct") if isinstance(spend, dict) else None
+        if not isinstance(pct, (int, float)) or pct >= 100.0:
+            return None
+        return num
 
     def _no_return_account(
         self,

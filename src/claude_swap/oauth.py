@@ -507,6 +507,12 @@ def build_usage_result(data: dict) -> dict | None:
         used_credits = eu.get("used_credits")
         monthly_limit = eu.get("monthly_limit")
         utilization = eu.get("utilization")
+        if utilization is None and used_credits is not None and monthly_limit:
+            # The API sends utilization=null before the first credit is spent.
+            try:
+                utilization = float(used_credits) / float(monthly_limit) * 100
+            except (TypeError, ValueError):
+                pass
         if used_credits is not None and monthly_limit is not None and utilization is not None:
             try:
                 spend_entry: dict = {
