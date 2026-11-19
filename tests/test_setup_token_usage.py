@@ -30,6 +30,20 @@ def test_parse_requires_both_windows():
     assert parse_usage_output("Current session\n4% used\nResets 5:10pm") is None
 
 
+def test_parse_week_only_account_once_the_view_is_drawn():
+    output = (
+        "Current week (all models)\n2% 2% used\nResets Nov 23 at 6am (Asia/Seoul)\n"
+        "What's contributing to your usage?\n"
+    )
+    assert parse_usage_output(output) is None  # footer not drawn yet
+    usage = parse_usage_output(output + "\u2190/\u2192 to switch \u00b7 Esc to close")
+    assert usage == {
+        "seven_day": {
+            "pct": 2.0, "clock": "Nov 23 at 6am (Asia/Seoul)", "countdown": "?",
+        },
+    }
+
+
 def test_parse_strips_ansi_sequences():
     output = (
         b"\x1b[2KCurrent session\r\n4% used\r\nResets 5:10pm (Asia/Seoul)\r\n"

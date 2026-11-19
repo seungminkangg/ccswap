@@ -65,7 +65,14 @@ def parse_usage_output(raw: bytes | str) -> dict | None:
             "countdown": "?",
         }
 
-    return result if "five_hour" in result and "seven_day" in result else None
+    if "five_hour" in result and "seven_day" in result:
+        return result
+    # Some accounts show no session window at all. The view lists the session
+    # window first, so once the week is drawn and the footer is on screen the
+    # missing 5h window is genuinely absent, not still rendering.
+    if "seven_day" in result and "esc to close" in raw[match.end():].lower():
+        return result
+    return None
 
 
 def fetch_setup_token_usage(
