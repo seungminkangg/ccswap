@@ -2045,6 +2045,48 @@ class TestCreditFallback:
         assert not any(isinstance(e, SwitchEvent) for e in h.events)
 
 
+class TestWeeklyCaps:
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, weekly_caps="3=60")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "borrowed@example.com")
+        return h
+
+    def test_capped_account_is_left_before_the_cap(self, temp_home):
+        h = self._harness(temp_home)
+        h.make_live("borrowed@example.com", 3)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(10), "3": {
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 59.0},
+            },
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_capped_account_at_its_cap_is_never_a_target(self, temp_home):
+        h = self._harness(temp_home)
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": {
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 60.0},
+            },
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+
+    def test_below_the_cap_it_is_an_ordinary_target(self, temp_home):
+        h = self._harness(temp_home)
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": {
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 20.0},
+            },
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+
 def test_spend_parsed_when_utilization_is_null():
     result = oauth.build_usage_result({
         "five_hour": {"utilization": 10.0},

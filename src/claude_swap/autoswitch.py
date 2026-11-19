@@ -1397,7 +1397,7 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch={current, *candidates}
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = self._decision_usage(entries)
             headroom = _headroom_by_account(usage, self._models, self._windows)
             policy = self._policy_headroom_map(usage, headroom)
             active_headroom = headroom.get(current)
@@ -1599,6 +1599,39 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    def _decision_usage(self, entries: dict) -> dict:
+        """Decision values, with ``weeklyCaps`` folded into the 7d window.
+
+        A capped account's weekly pct is rescaled so the cap reads as 100%:
+        ``3=60`` makes 60% look exhausted and 58.8% trip a 98% gate, so every
+        threshold, landing and escape rule already in place honours the cap.
+        Display paths read the store directly and keep the real number.
+        """
+        usage = {num: entry.decision_value() for num, entry in entries.items()}
+        for num, cap in self._weekly_caps().items():
+            value = usage.get(num)
+            week = value.get("seven_day") if isinstance(value, dict) else None
+            if isinstance(week, dict) and isinstance(week.get("pct"), (int, float)):
+                scaled = min(100.0, float(week["pct"]) * 100.0 / cap)
+                usage[num] = {**value, "seven_day": {**week, "pct": scaled}}
+        return usage
+
+    def _weekly_caps(self) -> dict[str, float]:
+        """``autoswitch.weeklyCaps`` ("3=60,a@b.com=50") resolved to slots."""
+        caps: dict[str, float] = {}
+        for item in (self.settings.weekly_caps or "").split(","):
+            key, sep, pct = item.partition("=")
+            try:
+                cap = float(pct)
+                num = self.switcher.resolve_account(key.strip())[0]
+            except (ValueError, ClaudeSwitchError):
+                if item.strip():
+                    _logger.warning("Ignoring weeklyCaps entry %r", item)
+                continue
+            if sep and 0.0 < cap < 100.0:
+                caps[num] = cap
+        return caps
 
     def _credit_fallback(
         self, usage: dict, settings: AutoSwitchSettings
@@ -2325,7 +2358,7 @@ class AutoSwitchEngine:
             # nomination preserves a valid future plan under the store lock.
             scheduled=not stale_candidate_plan,
         )
-        usage = {num: entry.decision_value() for num, entry in entries.items()}
+        usage = self._decision_usage(entries)
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
@@ -2382,7 +2415,7 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = self._decision_usage(entries)
 
         headroom = _headroom_by_account(usage, self._models, self._windows)
         return entries, usage, headroom

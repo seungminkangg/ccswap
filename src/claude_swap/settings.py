@@ -86,6 +86,10 @@ class AutoSwitchSettings:
     # credits instead of running the active account into its hard limit; it
     # leaves once a peer is back under the threshold by hysteresisPct.
     credit_fallback: str | None = None
+    # "3=60" or "3=60,a@b.com=50": per-account 7d ceilings, for borrowed
+    # accounts whose owner needs the rest of the week. The engine treats the
+    # cap as that account's 100%.
+    weekly_caps: str | None = None
     # Real, quota-consuming Haiku requests; deliberately opt-in.
     warmup_five_hour: bool = False
 
@@ -253,6 +257,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "creditFallback", "credit_fallback", "string",
             help="Account (num|email) whose extra-usage credits take over when all are spent",
+        ),
+        SettingSpec(
+            "autoswitch", "weeklyCaps", "weekly_caps", "string",
+            help="Per-account 7d ceilings treated as 100%, e.g. 3=60 or 3=60,a@b.com=50",
         ),
         SettingSpec(
             "ui", "language", "language", "choice", choices=tuple(LANGUAGES),
