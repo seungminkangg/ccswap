@@ -90,6 +90,11 @@ class AutoSwitchSettings:
     # accounts whose owner needs the rest of the week. The engine treats the
     # cap as that account's 100%.
     weekly_caps: str | None = None
+    # Codex's own gate for both its windows. None reuses threshold5h /
+    # threshold7d (Claude 7d maps to Codex Weekly), which suits Claude's two
+    # windows but leaves a Codex account, with its single weekly window and a
+    # desktop app that can only switch while idle, too little runway.
+    codex_threshold: float | None = None
     # Real, quota-consuming Haiku requests; deliberately opt-in.
     warmup_five_hour: bool = False
 
@@ -261,6 +266,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "weeklyCaps", "weekly_caps", "string",
             help="Per-account 7d ceilings treated as 100%, e.g. 3=60 or 3=60,a@b.com=50",
+        ),
+        SettingSpec(
+            "autoswitch", "codexThreshold", "codex_threshold", "optional_float", 1.0, 99.9,
+            help="Codex 5h/Weekly gate; unset reuses threshold5h/threshold7d",
         ),
         SettingSpec(
             "ui", "language", "language", "choice", choices=tuple(LANGUAGES),

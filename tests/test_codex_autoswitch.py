@@ -478,3 +478,21 @@ def test_a_hand_switch_is_adopted_once_its_account_is_usable(tmp_path):
         last_good={"five_hour": {"pct": 95}})), accounts[1])
     assert engine.tick() is TickOutcome.SWITCHED
     assert switcher.switched_to == ["2"]
+
+
+def test_codex_threshold_overrides_the_claude_weekly_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr("claude_swap.codex.is_codex_running", lambda: False)
+
+    def tick(**gates):
+        switcher = FakeCodexSwitcher(tmp_path, (
+            _weekly_account("1", 20, 3000, active=True, weekly_pct=92),
+            _weekly_account("2", 10, 2000, weekly_pct=1),
+        ))
+        engine = CodexAutoSwitchEngine(
+            switcher, AutoSwitchSettings(threshold=95, threshold_7d=98, **gates),
+            lambda _e: None, dry_run=True, clock=lambda: 1000,
+        )
+        return engine.tick()
+
+    assert tick() is TickOutcome.NO_ACTION  # 92% < Claude's 98% weekly gate
+    assert tick(codex_threshold=90) is TickOutcome.SWITCHED

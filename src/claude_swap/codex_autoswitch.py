@@ -45,6 +45,8 @@ def _ref(number: str, email: str) -> dict:
 
 
 def _codex_gates(settings: AutoSwitchSettings) -> dict[str, float]:
+    if settings.codex_threshold is not None:
+        return {"5h": settings.codex_threshold, "weekly": settings.codex_threshold}
     # Claude's 7d gate maps to Codex Weekly; model gates do not apply to Codex.
     return {
         ("weekly" if label == "7d" else label): pct
