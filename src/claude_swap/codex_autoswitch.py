@@ -10,6 +10,7 @@ to pick up the selected account.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -33,6 +34,8 @@ from claude_swap.codex import CodexAccountSwitcher, _codex_restart_hint
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import parse_reset_ts
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, gate_thresholds
+
+_logger = logging.getLogger("claude-swap")
 
 STATE_FILENAME = "codex_autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -83,6 +86,7 @@ class CodexAutoSwitchEngine:
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
         self._stop = threading.Event()
+        self._last_hold = ""
 
     @property
     def _restart_desktop(self) -> bool:
@@ -350,6 +354,10 @@ class CodexAutoSwitchEngine:
                     atomic_write_json(self.state_path, state)
                 raise
             if not result.get("switched"):
+                hold = f"{result.get('reason', 'already-active')}: {result.get('message', '')}"
+                if hold != self._last_hold:  # once per waiting stretch
+                    self._last_hold = hold
+                    _logger.info("Codex switch to %s held (%s)", target, hold)
                 # desktop-busy waits without starting the cooldown.
                 self._emit(NoSwitchEvent(
                     reason=result.get("reason", "already-active"),
@@ -362,6 +370,11 @@ class CodexAutoSwitchEngine:
             atomic_write_json(self.state_path, state)
 
         desktop = result.get("desktop")
+        self._last_hold = ""
+        _logger.info(
+            "Codex auto-switched %s -> %s (%s): %s", current, target, trigger,
+            desktop["message"] if desktop else "no desktop handoff",
+        )
         self._emit(
             SwitchEvent(
                 trigger=trigger,

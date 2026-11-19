@@ -450,6 +450,7 @@ def resume_stopped(switcher: CodexAccountSwitcher, bundle: str) -> list[str]:
     home = switcher.codex_home
     todo = [t for t in stopped_threads(home, now) if t[1] not in ledger]
     cli = _bundled_cli(bundle)
+    _logger.info("Codex resume: %d limit-stopped thread(s) to continue", len(todo))
     if not todo or cli is None:
         return []
     env = {**os.environ, "CODEX_HOME": str(home)}
